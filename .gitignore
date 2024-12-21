@@ -1,0 +1,6 @@
+data/images/*
+data/test/*
+__pycache__/
+.idea/
+.venv/
+checkpoints/
