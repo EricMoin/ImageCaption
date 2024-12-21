@@ -1,0 +1,15 @@
+{
+    "request": "dasdasda",
+    "cde": 200,
+    "message": "eerR:ereradasd",
+    "sign": "dsadasd",
+    "data": [
+        {
+            "release": "4.0.0",
+            "test": "3.1.2",
+            "release_url": "https://github.com/user/repo/releases/tag/4.0.0",
+            "test_url": "https://github.com/user/repo/releases/tag/4.0.0",
+            "changelog": "- 更新了一些已知问题"  
+        }
+    ]
+}
