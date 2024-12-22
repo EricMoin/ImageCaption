@@ -33,7 +33,7 @@ def main():
     max_val_samples = 1024     # 增加到200个验证样本
     batch_size = 64
     num_epochs = 50
-    max_len = 50
+    max_len = 80                                 
     num_workers = 0
     
     print("Loading datasets...")

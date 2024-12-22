@@ -131,7 +131,7 @@ def generate_caption(model, image, device, max_len=50):
     model.eval()
     
     with torch.no_grad():
-        # 编码像
+        # 编码图像
         memory = model.encoder(image)
         
         # 准备起始token
@@ -140,25 +140,32 @@ def generate_caption(model, image, device, max_len=50):
         
         generated = start_token
         
-        for _ in range(max_len - 1):
+        for i in range(max_len - 1):
             # 生成mask
             tgt_mask = model.decoder.generate_square_subsequent_mask(generated.size(1)).to(device)
             
             # 预测下一个token
             output = model.decoder(generated, memory, tgt_mask)
             
-            # 添加温度参数和top-k采样
-            temperature = 0.7
-            logits = output[:, -1:] / temperature
-            top_k = 5
-            
-            # 获取top-k的概率和索引
-            probs = torch.softmax(logits, dim=-1)
-            top_probs, top_indices = torch.topk(probs, k=top_k, dim=-1)
-            
-            # 根据概率采样
-            selected_indices = torch.multinomial(top_probs.squeeze(1), num_samples=1)
-            next_token = top_indices.squeeze(1).gather(1, selected_indices)
+            # 如果接近最大长度，强制选择END token
+            if i >= max_len - 3:
+                next_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)  # <END> token
+            else:
+                # 添加温度参数和top-k采样
+                temperature = 0.7
+                logits = output[:, -1:] / temperature
+                
+                # 在最后几个token时增加END token的概率
+                if i >= max_len * 0.8:  # 当生成80%的序列长度后
+                    logits[:, :, 2] += 2.0  # 增加END token的logit值
+                
+                # top-k采样
+                top_k = 5
+                top_probs, top_indices = torch.topk(torch.softmax(logits, dim=-1), k=top_k, dim=-1)
+                
+                # 根据概率采样
+                selected_indices = torch.multinomial(top_probs.squeeze(1), num_samples=1)
+                next_token = top_indices.squeeze(1).gather(1, selected_indices)
             
             # 添加预测的token
             generated = torch.cat([generated, next_token], dim=1)
@@ -166,6 +173,11 @@ def generate_caption(model, image, device, max_len=50):
             # 如果生成了结束token，就停止
             if (next_token == 2).all():  # <END> token
                 break
+        
+        # 如果没有生成END token，在最后添加
+        if generated[:, -1] != 2:
+            end_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)
+            generated = torch.cat([generated, end_token], dim=1)
     
     return generated
 
