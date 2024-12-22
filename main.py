@@ -29,8 +29,8 @@ def main():
     ])
     
     # 设置数据限制 - 增加训练样本数量
-    max_train_samples = 10155  # 增加到10155个训练样本
-    max_val_samples = 1024     # 增加到1024个验证样本
+    max_train_samples = None  # 增加到10155个训练样本
+    max_val_samples = None     # 增加到1024个验证样本
     batch_size = 64
     num_epochs = 50
     max_len = 80                                 
