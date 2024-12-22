@@ -3,7 +3,7 @@ import torchvision
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.bleu_score import SmoothingFunction
 
-def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
+def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     num_batches = len(dataloader)
@@ -22,7 +22,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
         tgt_output = captions[:, 1:]
         
         # 创建mask
-        tgt_mask = model.decoder.generate_square_subsequent_mask(tgt_input.size(1)).to(device)
+        tgt_mask = model.generate_square_subsequent_mask(tgt_input.size(1)).to(device)
         
         # 前向传播
         optimizer.zero_grad()
@@ -37,7 +37,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
             )
             one_hot = one_hot * (1 - smooth_factor) + (smooth_factor / n_classes)
             
-            # 使用KL散度作为损失函数
+            # 使用KL散度作为损失
             log_prb = torch.log_softmax(output, dim=-1)
             loss = -(one_hot * log_prb).sum(dim=-1).mean()
             
@@ -81,7 +81,7 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
             images = images.to(device)
             
             # 生成描述
-            generated_ids = generate_caption(model, images, device)
+            generated_ids = generate_caption(model, images, device, vocab_idx2word)
             
             # 转换为文本
             for gen_ids, cap_ids in zip(generated_ids, captions):
@@ -127,25 +127,49 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
     
     return bleu1, bleu4
 
-def generate_caption(model, image, device, max_len=50):
+def generate_caption(model, image, device, vocab_idx2word, max_len=50):
     model.eval()
     
     with torch.no_grad():
-        # 编码图像
-        memory = model.encoder(image)
+        # ��取网格特征
+        features = model.backbone(image)  # [batch_size, 2048, 7, 7]
+        
+        # 投影到d_model维度
+        features = model.feature_projection(features)  # [batch_size, d_model, 7, 7]
+        
+        # 重塑为序列
+        batch_size = features.size(0)
+        features = features.view(batch_size, features.size(1), -1).permute(0, 2, 1)  # [batch_size, 49, d_model]
+        
+        # Transformer编码
+        memory = model.transformer_encoder(features)  # [batch_size, 49, d_model]
         
         # 准备起始token
-        batch_size = image.size(0)
         start_token = torch.full((batch_size, 1), 1, dtype=torch.long).to(device)  # <START> token
         
         generated = start_token
         
         for i in range(max_len - 1):
             # 生成mask
-            tgt_mask = model.decoder.generate_square_subsequent_mask(generated.size(1)).to(device)
+            tgt_mask = model.generate_square_subsequent_mask(generated.size(1)).to(device)
             
-            # 预测下一个token
-            output = model.decoder(generated, memory, tgt_mask)
+            # 词嵌入
+            tgt = model.embedding(generated)  # [batch_size, seq_len, d_model]
+            
+            # 位置编码
+            tgt = tgt.transpose(0, 1)  # [seq_len, batch_size, d_model]
+            tgt = model.pos_encoder(tgt)
+            tgt = tgt.transpose(0, 1)  # [batch_size, seq_len, d_model]
+            
+            # Transformer解码
+            output = model.transformer_decoder(
+                tgt,
+                memory,
+                tgt_mask=tgt_mask
+            )
+            
+            # 生成词概率
+            output = model.output_layer(output)  # [batch_size, seq_len, vocab_size]
             
             # 如果接近最大长度，强制选择END token
             if i >= max_len - 3:
@@ -175,7 +199,7 @@ def generate_caption(model, image, device, max_len=50):
                 break
         
         # 如果没有生成END token，在最后添加
-        if generated[:, -1] != 2:
+        if not (generated[:, -1] == 2).all():
             end_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)
             generated = torch.cat([generated, end_token], dim=1)
     

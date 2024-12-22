@@ -29,11 +29,12 @@ def main():
     ])
     
     # 设置数据限制 - 增加训练样本数量
-    max_train_samples = 10155  # 增加到1000个训练样本
-    max_val_samples = 1024     # 增加到200个验证样本
+    max_train_samples = None  # 增加到1000个训练样本
+    max_val_samples = None     # 增加到200个验证样本
     batch_size = 64
-    num_epochs = 50
-    max_len = 80                                 
+    num_epochs = 100
+    nhead = 16
+    max_len = 50                             
     num_workers = 0
     
     print("Loading datasets...")
@@ -85,6 +86,7 @@ def main():
     # 初始化模型 - 添加dropout
     model = ImageCaptioningModel(
         vocab_size=len(train_dataset.vocab),
+        nhead=nhead,
         d_model=512
     ).to(device)
     
@@ -123,6 +125,7 @@ def main():
             # 重新创建模型
             model = ImageCaptioningModel(
                 vocab_size=current_vocab_size,
+                nhead=nhead,
                 d_model=512
             ).to(device)
             
