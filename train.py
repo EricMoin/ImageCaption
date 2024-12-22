@@ -1,7 +1,27 @@
 import torch
+import torch.nn as nn
 import torchvision
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.bleu_score import SmoothingFunction
+
+# 定义特殊token的索引
+START_TOKEN = 1
+END_TOKEN = 2
+PAD_TOKEN = 0
+UNK_TOKEN = 3
+
+def get_period_token_id(vocab_idx2word):
+    """获取句号的token ID"""
+    # 打印词表以便调试
+    print("\nSearching for period token in vocabulary...")
+    for idx, word in vocab_idx2word.items():
+        if word in ['.', '。', '．']:  # 添加更多可能的句号形式
+            print(f"Found period token: '{word}' with ID: {idx}")
+            return idx
+    
+    # 如果找不到句号，使用默认的句号ID
+    print("Warning: No period token found in vocabulary, using default token.")
+    return END_TOKEN  # 暂时使用END token作为句号
 
 def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
     model.train()
@@ -37,7 +57,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
             )
             one_hot = one_hot * (1 - smooth_factor) + (smooth_factor / n_classes)
             
-            # 使用KL散度作为损失函数
+            # 使用KL散度作为损失
             log_prb = torch.log_softmax(output, dim=-1)
             loss = -(one_hot * log_prb).sum(dim=-1).mean()
             
@@ -81,54 +101,79 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
             images = images.to(device)
             
             # 生成描述
-            generated_ids = generate_caption(model, images, device)
+            generated_ids = generate_caption(model, images, device, vocab_idx2word)
+            if generated_ids is None:
+                print("Warning: Using empty generation for this batch")
+                # 使用空生成而不是跳过
+                generated_ids = torch.full((images.size(0), 3), END_TOKEN, dtype=torch.long).to(device)
             
             # 转换为文本
             for gen_ids, cap_ids in zip(generated_ids, captions):
                 # 处理生成的描述
                 pred_tokens = [vocab_idx2word[idx.item()] for idx in gen_ids 
-                             if idx.item() not in [0, 1, 2, 3]]  # 移除特殊token
+                             if idx.item() not in [PAD_TOKEN, START_TOKEN, END_TOKEN]]
                 if not pred_tokens:  # 如果生成的描述为空，添加一个占位符
                     pred_tokens = ['<unk>']
                 hypotheses.append(pred_tokens)
                 
                 # 处理真实描述
                 ref_tokens = [vocab_idx2word[idx.item()] for idx in cap_ids 
-                            if idx.item() not in [0, 1, 2, 3]]
+                            if idx.item() not in [PAD_TOKEN, START_TOKEN, END_TOKEN]]
                 if not ref_tokens:  # 如果参考描述为空，添加一个占位符
                     ref_tokens = ['<unk>']
                 references.append([ref_tokens])
             
-            # 打印评估进度
+            # 打印评估进度和样本
             print(f'Evaluating batch [{batch_idx+1}/{num_batches}]')
+            if batch_idx == 0:
+                print("\nSample generations:")
+                for i in range(min(3, len(hypotheses))):
+                    print(f"Generated {i+1}: {' '.join(hypotheses[i])}")
+                    print(f"Reference {i+1}: {' '.join(references[i][0])}")
+    
+    # 确保至少有一个有效的预测和参考
+    if not hypotheses or not references:
+        print("Warning: No valid predictions or references")
+        return 0.0, 0.0
     
     try:
-        # 计算BLEU分数，使用平滑函数
+        # 计算BLEU分数
         bleu1 = corpus_bleu(references, hypotheses, 
                            weights=(1.0, 0, 0, 0),
                            smoothing_function=smoothing)
         bleu4 = corpus_bleu(references, hypotheses, 
                            weights=(0.25, 0.25, 0.25, 0.25),
                            smoothing_function=smoothing)
-        
-        # 打印一些样本结果
-        print("\nSample predictions:")
-        for i in range(min(3, len(hypotheses))):
-            print(f"\nReference: {' '.join(references[i][0])}")
-            print(f"Generated: {' '.join(hypotheses[i])}")
-            
     except Exception as e:
         print("Error calculating BLEU score:")
         print(f"Number of references: {len(references)}")
         print(f"Number of hypotheses: {len(hypotheses)}")
         print("Sample reference:", references[0] if references else "No references")
         print("Sample hypothesis:", hypotheses[0] if hypotheses else "No hypotheses")
-        raise e
+        print(f"Error: {str(e)}")
+        return 0.0, 0.0
+    
+    # 打印样本结果
+    print("\nSample predictions:")
+    for i in range(min(3, len(hypotheses))):
+        print(f"\nReference: {' '.join(references[i][0])}")
+        print(f"Generated: {' '.join(hypotheses[i])}")
     
     return bleu1, bleu4
 
-def generate_caption(model, image, device, max_len=50):
+def generate_caption(model, image, device, vocab_idx2word, max_len=50):
     model.eval()
+    
+    # 获取句号的token ID
+    PERIOD_TOKEN = None
+    for idx, word in vocab_idx2word.items():
+        if word == '.':
+            PERIOD_TOKEN = idx
+            break
+    
+    if PERIOD_TOKEN is None:
+        print("Warning: Period token not found in vocabulary")
+        return None
     
     with torch.no_grad():
         # 编码图像
@@ -136,48 +181,117 @@ def generate_caption(model, image, device, max_len=50):
         
         # 准备起始token
         batch_size = image.size(0)
-        start_token = torch.full((batch_size, 1), 1, dtype=torch.long).to(device)  # <START> token
+        start_token = torch.full((batch_size, 1), START_TOKEN, dtype=torch.long).to(device)
         
         generated = start_token
         
-        for i in range(max_len - 1):
+        # 动态调整温度参数
+        base_temperature = 1.2  # 增加基础温度以提高多样性
+        min_temperature = 0.6   # 增加最小温度以保持多样性
+        
+        # 句子结构控制
+        min_words_per_sentence = 5  # 每个句子的最小词数
+        max_sentences = 3       # 最大句子数量
+        sentence_count = torch.zeros(batch_size, dtype=torch.long).to(device)
+        words_since_period = torch.zeros(batch_size, dtype=torch.long).to(device)
+        
+        for i in range(max_len - 1):  # 预留空间给END token
             # 生成mask
             tgt_mask = model.decoder.generate_square_subsequent_mask(generated.size(1)).to(device)
             
             # 预测下一个token
             output = model.decoder(generated, memory, tgt_mask)
+            logits = output[:, -1:]
             
-            # 如果接近最大长度，强制选择END token
-            if i >= max_len - 3:
-                next_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)  # <END> token
-            else:
-                # 添加温度参数和top-k采样
-                temperature = 0.7
-                logits = output[:, -1:] / temperature
+            # 动态调整温度参数
+            progress = i / max_len
+            temperature = max(min_temperature, base_temperature * (1 - progress * 0.5))
+            logits = logits / temperature
+            
+            # 更新句子统计
+            last_token = generated[:, -1]
+            sentence_count += (last_token == PERIOD_TOKEN).long()
+            words_since_period += 1
+            words_since_period *= (last_token != PERIOD_TOKEN).long()  # 如果是句号则重置
+            
+            # 调整token概率
+            for b in range(batch_size):
+                # 禁用句号直到达到最小词数
+                if words_since_period[b] < min_words_per_sentence:
+                    logits[b, :, PERIOD_TOKEN] = float('-inf')
                 
-                # 在最后几个token时增加END token的概率
-                if i >= max_len * 0.8:  # 当生成80%的序列长度后
-                    logits[:, :, 2] += 2.0  # 增加END token的logit值
+                # 如果句子太长，增加句号概率
+                elif words_since_period[b] >= min_words_per_sentence * 2:
+                    period_boost = (words_since_period[b] - min_words_per_sentence) * 0.5
+                    logits[b, :, PERIOD_TOKEN] += period_boost
                 
-                # top-k采样
-                top_k = 5
-                top_probs, top_indices = torch.topk(torch.softmax(logits, dim=-1), k=top_k, dim=-1)
-                
-                # 根据概率采样
-                selected_indices = torch.multinomial(top_probs.squeeze(1), num_samples=1)
-                next_token = top_indices.squeeze(1).gather(1, selected_indices)
+                # 如果已经生成足够的句子，强制结束
+                if sentence_count[b] >= max_sentences:
+                    logits[b, :, :] = float('-inf')  # 禁用所有token
+                    logits[b, :, END_TOKEN] = 0.0  # 只允许END token
+            
+            # 使用top-k和top-p采样
+            top_k = 5
+            top_p = 0.9
+            
+            # 首先进行top-k过滤
+            top_k_logits, top_k_indices = torch.topk(logits, k=min(top_k, logits.size(-1)), dim=-1)
+            top_k_probs = torch.softmax(top_k_logits, dim=-1)
+            
+            # 然后进行top-p (nucleus) 采样
+            sorted_probs, sorted_indices = torch.sort(top_k_probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            # 应用top-p过滤
+            filtered_probs = sorted_probs.clone()
+            filtered_probs[sorted_indices_to_remove] = 0
+            filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+            
+            # 采样
+            selected_indices = torch.multinomial(filtered_probs.squeeze(1), num_samples=1)
+            next_token_idx = sorted_indices.squeeze(1).gather(1, selected_indices)
+            next_token = top_k_indices.squeeze(1).gather(1, next_token_idx)
             
             # 添加预测的token
             generated = torch.cat([generated, next_token], dim=1)
             
-            # 如果生成了结束token，就停止
-            if (next_token == 2).all():  # <END> token
+            # 检查是否所有序列都生成了END token
+            if (next_token == END_TOKEN).all():
                 break
+            
+            # 如果序列太长，检查是否可以结束
+            if i >= max_len - 10:
+                # 如果已经生成了至少一个完整的句子，可以结束
+                if (sentence_count >= 1).all():
+                    end_token = torch.full((batch_size, 1), END_TOKEN, dtype=torch.long).to(device)
+                    generated = torch.cat([generated, end_token], dim=1)
+                    break
         
-        # 如果没有生成END token，在最后添加
-        if generated[:, -1] != 2:
-            end_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)
-            generated = torch.cat([generated, end_token], dim=1)
+        # 确保所有序列都有合适的结束
+        final_sequences = []
+        for i in range(batch_size):
+            seq = generated[i]
+            # 如果序列没有以句号或END token结束，添加它们
+            if seq[-1] != END_TOKEN:
+                if seq[-1] != PERIOD_TOKEN:
+                    seq = torch.cat([seq, torch.tensor([PERIOD_TOKEN], dtype=torch.long).to(device)])
+                seq = torch.cat([seq, torch.tensor([END_TOKEN], dtype=torch.long).to(device)])
+            final_sequences.append(seq)
+        
+        # 将所有序列填充到相同长度
+        max_seq_len = max(len(seq) for seq in final_sequences)
+        padded_sequences = []
+        for seq in final_sequences:
+            if len(seq) < max_seq_len:
+                padding = torch.full((max_seq_len - len(seq),), PAD_TOKEN, 
+                                  dtype=torch.long).to(device)
+                seq = torch.cat([seq, padding])
+            padded_sequences.append(seq)
+        
+        generated = torch.stack(padded_sequences)
     
     return generated
 
@@ -185,7 +299,7 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 num_epochs, criterion, optimizer, scheduler, device, checkpoint_path):
     best_bleu4 = 0
     best_loss = float('inf')
-    patience = 3  # 降低耐心值
+    patience = 3  # 降低心值
     no_improve_bleu = 0  # BLEU-4没有改善的轮数
     no_improve_loss = 0  # Loss没有改善的轮数
     min_delta = 1e-4  # 最小改善阈值
@@ -295,7 +409,7 @@ def generate_description(model, image_path, transform, vocab_idx2word, device):
     
     # 生成描述
     with torch.no_grad():
-        generated_ids = generate_caption(model, image, device)
+        generated_ids = generate_caption(model, image, device, vocab_idx2word)
         
     # 转换为文本
     tokens = [vocab_idx2word[idx.item()] for idx in generated_ids[0]

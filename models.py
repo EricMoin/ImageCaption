@@ -90,12 +90,12 @@ class GridEncoder(nn.Module):
         return features
 
 class GridDecoder(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=3, dropout=0.1):
+    def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=3, dropout=0.1, max_length=80):
         super().__init__()
         
         # 词嵌入层
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, 50, d_model))  # 最大长度50
+        self.pos_embed = nn.Parameter(torch.randn(1, max_length, d_model))  # 使用max_length参数
         
         # 多层自注意力
         self.self_attention_layers = nn.ModuleList([
@@ -129,12 +129,13 @@ class GridDecoder(nn.Module):
         x = self.embedding(tgt)
         
         # 2. 添加位置编码
-        x = x + self.pos_embed[:, :x.size(1)]
+        seq_len = x.size(1)
+        x = x + self.pos_embed[:, :seq_len]
         x = self.dropout(x)
         
         # 3. 生成mask（如果没有提供）
         if tgt_mask is None:
-            tgt_mask = self.generate_square_subsequent_mask(x.size(1)).to(x.device)
+            tgt_mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
         
         # 4. 多层自注意力
         for layer in self.self_attention_layers:
@@ -150,21 +151,22 @@ class GridDecoder(nn.Module):
         return output
 
 class ImageCaptioningModel(nn.Module):
-    def __init__(self, vocab_size, d_model=512):
+    def __init__(self, vocab_size, d_model=512, max_length=80):
         super().__init__()
         self.encoder = GridEncoder(
             grid_size=7,
             d_model=d_model,
             nhead=8,
-            num_layers=3,  # 使用3层注意力
+            num_layers=3,
             dropout=0.1
         )
         self.decoder = GridDecoder(
             vocab_size=vocab_size,
             d_model=d_model,
             nhead=8,
-            num_layers=3,  # 使用3层注意力
-            dropout=0.1
+            num_layers=3,
+            dropout=0.1,
+            max_length=max_length  # 传递max_length参数
         )
         
     def forward(self, img, tgt, tgt_mask=None):

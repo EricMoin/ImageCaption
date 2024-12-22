@@ -111,7 +111,7 @@ class ImageCaptioningDataset(Dataset):
     
     def _init_special_tokens(self):
         """初始化特殊标记"""
-        special_tokens = ['<PAD>', '<START>', '<END>', '<UNK>']
+        special_tokens = ['<PAD>', '<START>', '<END>', '<UNK>', '.']  # 添加句号作为特殊标记
         for idx, token in enumerate(special_tokens):
             self.vocab[token] = idx
     
@@ -119,8 +119,8 @@ class ImageCaptioningDataset(Dataset):
         """清理和标准化文本"""
         # 转换为小写
         text = text.lower()
-        # 移除特殊字符和多余的空白
-        text = re.sub(r'[^\w\s]', ' ', text)
+        # 保留句号，但移除其他特殊字符
+        text = re.sub(r'[^\w\s\.]', ' ', text)  # 修改正则表达式以保留句号
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
@@ -144,12 +144,11 @@ class ImageCaptioningDataset(Dataset):
             
             batch = all_captions[i:i + batch_size]
             for text in batch:
-                # 清理文本
+                # 清理文本，保留句号
                 clean_text = self._clean_text(text)
                 # 分词
                 tokens = word_tokenize(clean_text)
-                # 添加到词集合（可选：过滤停用词）
-                # tokens = [token for token in tokens if token not in stop_words]
+                # 添加到词集合
                 word_set.update(tokens)
         
         # 将收集到的词添加到词表中
@@ -166,6 +165,13 @@ class ImageCaptioningDataset(Dataset):
         assert self.vocab['<START>'] == 1
         assert self.vocab['<END>'] == 2
         assert self.vocab['<UNK>'] == 3
+        assert self.vocab['.'] == 4  # 确保句号在词表中
+        
+        # 打印词表中的标点符号
+        print("\nPunctuation marks in vocabulary:")
+        for word, idx in self.vocab.items():
+            if word in ['.', ',', '!', '?', ';', ':']:
+                print(f"'{word}': {idx}")
     
     def _preload_images(self):
         """预加载所有图像到内存"""
