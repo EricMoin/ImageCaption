@@ -299,7 +299,7 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 num_epochs, criterion, optimizer, scheduler, device, checkpoint_path):
     best_bleu4 = 0
     best_loss = float('inf')
-    patience = 3  # 降低心值
+    patience = 5  # 增加耐心值
     no_improve_bleu = 0  # BLEU-4没有改善的轮数
     no_improve_loss = 0  # Loss没有改善的轮数
     min_delta = 1e-4  # 最小改善阈值
@@ -309,9 +309,9 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
     vocab_idx2word = {int(idx): word for idx, word in vocab_idx2word.items()}
     
     # 学习率预热
-    warmup_epochs = 2  # 减少预热轮数
+    warmup_epochs = 2
     warmup_factor = 0.1
-    initial_lr = optimizer.param_groups[0]['lr']  # 保存初始学习率
+    initial_lr = optimizer.param_groups[0]['lr']
     
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch+1}/{num_epochs}')
@@ -362,7 +362,7 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 'bleu4': bleu4,
                 'vocab_size': vocab_size,
                 'vocab_idx2word': vocab_idx2word,
-                'initial_lr': initial_lr  # 保存初始学习率
+                'initial_lr': initial_lr
             }, f'{checkpoint_path}/best_model.pth')
             print(f'\nNew best model saved! BLEU-4: {bleu4:.4f}')
         else:
@@ -372,16 +372,11 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
         print(f'\nNo improvement count - Loss: {no_improve_loss}, BLEU-4: {no_improve_bleu}')
         print(f'Best scores - Loss: {best_loss:.4f}, BLEU-4: {best_bleu4:.4f}')
         
-        # 早停条件：
-        # 1. Loss连续3轮没有改善
-        # 2. BLEU-4连续3轮没有改善
-        # 3. 学习率已经很小
-        if (no_improve_loss >= patience and no_improve_bleu >= patience) or \
-           current_lr < 1e-6:
+        # 早停条件：只在性能没有改善时停止
+        if no_improve_loss >= patience and no_improve_bleu >= patience:
             print(f'\nEarly stopping:')
             print(f'- Loss not improved for {no_improve_loss} epochs')
             print(f'- BLEU-4 not improved for {no_improve_bleu} epochs')
-            print(f'- Current learning rate: {current_lr}')
             break
         
         # 定期保存检查点
@@ -395,7 +390,7 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 'bleu4': bleu4,
                 'vocab_size': vocab_size,
                 'vocab_idx2word': vocab_idx2word,
-                'initial_lr': initial_lr  # 保存初始学习率
+                'initial_lr': initial_lr
             }, f'{checkpoint_path}/checkpoint_epoch{epoch+1}.pth')
             
         print('-' * 50)

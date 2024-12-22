@@ -29,8 +29,8 @@ def main():
     ])
     
     # 设置数据限制 - 增加训练样本数量
-    max_train_samples = 1024  # 增加到1000个训练样本
-    max_val_samples = 256     # 增加到200个验证样本
+    max_train_samples = 10155  # 增加到10155个训练样本
+    max_val_samples = 1024     # 增加到1024个验证样本
     batch_size = 64
     num_epochs = 50
     max_len = 80                                 
@@ -86,6 +86,7 @@ def main():
     model = ImageCaptioningModel(
         vocab_size=len(train_dataset.vocab),
         max_length=max_len,
+        nhead=8,
         d_model=512
     ).to(device)
     

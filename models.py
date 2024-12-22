@@ -151,22 +151,25 @@ class GridDecoder(nn.Module):
         return output
 
 class ImageCaptioningModel(nn.Module):
-    def __init__(self, vocab_size, d_model=512, max_length=80):
+    def __init__(self, vocab_size, nhead=8, num_layers=3, d_model=512, max_length=80):
         super().__init__()
+        # 确保d_model能被nhead整除
+        d_model = (d_model // nhead) * nhead
+        
         self.encoder = GridEncoder(
             grid_size=7,
             d_model=d_model,
-            nhead=8,
-            num_layers=3,
+            nhead=nhead,
+            num_layers=num_layers,
             dropout=0.1
         )
         self.decoder = GridDecoder(
             vocab_size=vocab_size,
             d_model=d_model,
-            nhead=8,
-            num_layers=3,
+            nhead=nhead,
+            num_layers=num_layers,
             dropout=0.1,
-            max_length=max_length  # 传递max_length参数
+            max_length=max_length
         )
         
     def forward(self, img, tgt, tgt_mask=None):
