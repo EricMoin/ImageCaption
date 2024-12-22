@@ -10,6 +10,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
     
     print(f"Training on {len(dataloader.dataset)} samples in {num_batches} batches")
     
+    # 梯度裁剪阈值
+    grad_clip = 1.0
+    
     for batch_idx, (images, captions) in enumerate(dataloader):
         images = images.to(device)
         captions = captions.to(device)
@@ -26,11 +29,25 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
         try:
             output = model(images, tgt_input, tgt_mask)
             
-            # 计算损失
-            loss = criterion(output.reshape(-1, output.size(-1)), tgt_output.reshape(-1))
+            # 计算损失，添加标签平滑
+            smooth_factor = 0.1
+            n_classes = output.size(-1)
+            one_hot = torch.zeros_like(output).scatter(
+                2, tgt_output.unsqueeze(-1), 1
+            )
+            one_hot = one_hot * (1 - smooth_factor) + (smooth_factor / n_classes)
+            
+            # 使用KL散度作为损失函数
+            log_prb = torch.log_softmax(output, dim=-1)
+            loss = -(one_hot * log_prb).sum(dim=-1).mean()
             
             # 反向传播
             loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            
+            # 更新参数
             optimizer.step()
             
             total_loss += loss.item()
@@ -114,7 +131,7 @@ def generate_caption(model, image, device, max_len=50):
     model.eval()
     
     with torch.no_grad():
-        # 编码图像
+        # 编码像
         memory = model.encoder(image)
         
         # 准备起始token
@@ -129,7 +146,19 @@ def generate_caption(model, image, device, max_len=50):
             
             # 预测下一个token
             output = model.decoder(generated, memory, tgt_mask)
-            next_token = output[:, -1:].argmax(dim=-1)
+            
+            # 添加温度参数和top-k采样
+            temperature = 0.7
+            logits = output[:, -1:] / temperature
+            top_k = 5
+            
+            # 获取top-k的概率和索引
+            probs = torch.softmax(logits, dim=-1)
+            top_probs, top_indices = torch.topk(probs, k=top_k, dim=-1)
+            
+            # 根据概率采样
+            selected_indices = torch.multinomial(top_probs.squeeze(1), num_samples=1)
+            next_token = top_indices.squeeze(1).gather(1, selected_indices)
             
             # 添加预测的token
             generated = torch.cat([generated, next_token], dim=1)
@@ -143,15 +172,31 @@ def generate_caption(model, image, device, max_len=50):
 def train_model(model, train_loader, val_loader, vocab_idx2word, 
                 num_epochs, criterion, optimizer, scheduler, device, checkpoint_path):
     best_bleu4 = 0
+    best_loss = float('inf')
+    patience = 3  # 降低耐心值
+    no_improve_bleu = 0  # BLEU-4没有改善的轮数
+    no_improve_loss = 0  # Loss没有改善的轮数
+    min_delta = 1e-4  # 最小改善阈值
     
     # 保存词表信息
     vocab_size = len(vocab_idx2word)
-    # 确保词表索引是整数类型
     vocab_idx2word = {int(idx): word for idx, word in vocab_idx2word.items()}
+    
+    # 学习率预热
+    warmup_epochs = 2  # 减少预热轮数
+    warmup_factor = 0.1
+    initial_lr = optimizer.param_groups[0]['lr']  # 保存初始学习率
     
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch+1}/{num_epochs}')
         print('-' * 50)
+        
+        # 学习率预热
+        if epoch < warmup_epochs:
+            factor = warmup_factor + (1 - warmup_factor) * (epoch / warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = initial_lr * factor
+                print(f'Warmup learning rate: {param_group["lr"]:.6f}')
         
         # 训练一个epoch
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
@@ -164,14 +209,24 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
         print(f'BLEU-4: {bleu4:.4f}')
         
         # 更新学习率
-        scheduler.step(bleu4)  # 使用BLEU-4分数来调整学习率
+        scheduler.step(bleu4)
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current learning rate: {current_lr:.6f}')
         
-        # 保存最佳模型
-        if bleu4 > best_bleu4:
+        # 检查是否有显著改善
+        loss_improved = train_loss < (best_loss - min_delta)
+        bleu_improved = bleu4 > (best_bleu4 + min_delta)
+        
+        if loss_improved:
+            best_loss = train_loss
+            no_improve_loss = 0
+        else:
+            no_improve_loss += 1
+            
+        if bleu_improved:
             best_bleu4 = bleu4
-            # 保存检查点，包含词表信息
+            no_improve_bleu = 0
+            # 保存最佳模型
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -180,13 +235,31 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 'loss': train_loss,
                 'bleu4': bleu4,
                 'vocab_size': vocab_size,
-                'vocab_idx2word': vocab_idx2word
+                'vocab_idx2word': vocab_idx2word,
+                'initial_lr': initial_lr  # 保存初始学习率
             }, f'{checkpoint_path}/best_model.pth')
             print(f'\nNew best model saved! BLEU-4: {bleu4:.4f}')
+        else:
+            no_improve_bleu += 1
+        
+        # 打印改善状态
+        print(f'\nNo improvement count - Loss: {no_improve_loss}, BLEU-4: {no_improve_bleu}')
+        print(f'Best scores - Loss: {best_loss:.4f}, BLEU-4: {best_bleu4:.4f}')
+        
+        # 早停条件：
+        # 1. Loss连续3轮没有改善
+        # 2. BLEU-4连续3轮没有改善
+        # 3. 学习率已经很小
+        if (no_improve_loss >= patience and no_improve_bleu >= patience) or \
+           current_lr < 1e-6:
+            print(f'\nEarly stopping:')
+            print(f'- Loss not improved for {no_improve_loss} epochs')
+            print(f'- BLEU-4 not improved for {no_improve_bleu} epochs')
+            print(f'- Current learning rate: {current_lr}')
+            break
         
         # 定期保存检查点
         if (epoch + 1) % 5 == 0:
-            # 保存检查点，包含词表信息
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -195,7 +268,8 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 'loss': train_loss,
                 'bleu4': bleu4,
                 'vocab_size': vocab_size,
-                'vocab_idx2word': vocab_idx2word
+                'vocab_idx2word': vocab_idx2word,
+                'initial_lr': initial_lr  # 保存初始学习率
             }, f'{checkpoint_path}/checkpoint_epoch{epoch+1}.pth')
             
         print('-' * 50)

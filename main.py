@@ -29,43 +29,53 @@ def main():
     ])
     
     # 设置数据限制 - 增加训练样本数量
-    max_train_samples = 1000  # 增加到1000个训练样本
-    max_val_samples = 200     # 增加到200个验证样本
+    max_train_samples = 10155  # 增加到1000个训练样本
+    max_val_samples = 1024     # 增加到200个验证样本
+    batch_size = 64
+    num_epochs = 50
+    max_len = 50
+    num_workers = 0
     
     print("Loading datasets...")
     # 创建数据集
+    print("Loading training dataset...")
     train_dataset = ImageCaptioningDataset(
         image_folder='data/images',
         annotations_file='data/train_captions.json',
         transform=transform,
-        max_length=50,
-        max_samples=max_train_samples
+        max_length=max_len,
+        max_samples=max_train_samples,
+        use_cache=True  # 启用缓存
     )
     
+    print("Loading validation dataset...")
     val_dataset = ImageCaptioningDataset(
         image_folder='data/images',
         annotations_file='data/test_captions.json',
         transform=transform,
-        max_length=50,
-        max_samples=max_val_samples
+        max_length=max_len,
+        max_samples=max_val_samples,
+        use_cache=True  # 启用缓存
     )
     
     print("\nCreating data loaders...")
-    # 创建数据加载器 - 减小batch size以增加更新次数
+    # 创建数据加载器 - 优化worker数量和内存使用
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=16,  # 减小batch size
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=num_workers,  # 减少worker数量
+        pin_memory=False,  # 关闭pin_memory以减少内存使用
+        persistent_workers=False  # 关闭持久化workers
     )
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=16,  # 减小batch size
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=num_workers,  # 减少worker数量
+        pin_memory=False,  # 关闭pin_memory以减少内存使用
+        persistent_workers=False  # 关闭持久化workers
     )
     
     # 创建词表的反向映射（索引到单词）
@@ -81,16 +91,11 @@ def main():
     # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss(ignore_index=train_dataset.vocab['<PAD>'])
     
-    # 使用带有权重衰减的Adam优化器来增加正则化
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=0.0001,
-        weight_decay=0.01,  # 添加L2正则化
-        betas=(0.9, 0.999)
-    )
-    
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    # 创建优化器和学习率调度器
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+
+    # 使用余弦退火学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='max',
         factor=0.5,
@@ -104,10 +109,44 @@ def main():
     if os.path.exists(checkpoint_file):
         print(f"Loading checkpoint from {checkpoint_file}")
         checkpoint = torch.load(checkpoint_file, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-        print(f"Loaded checkpoint from epoch {start_epoch}")
+        
+        # 检查词表大小是否匹配
+        checkpoint_vocab_size = checkpoint.get('vocab_size')
+        current_vocab_size = len(train_dataset.vocab)
+        
+        if checkpoint_vocab_size != current_vocab_size:
+            print(f"\nWarning: Vocabulary size mismatch!")
+            print(f"Checkpoint vocabulary size: {checkpoint_vocab_size}")
+            print(f"Current vocabulary size: {current_vocab_size}")
+            print("Creating new model with current vocabulary size...")
+            
+            # 重新创建模型
+            model = ImageCaptioningModel(
+                vocab_size=current_vocab_size,
+                d_model=512
+            ).to(device)
+            
+            # 重新初始化优化器和调度器
+            optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='max',
+                factor=0.5,
+                patience=2,
+                verbose=True
+            )
+        else:
+            # 词表大小匹配，可以加载检查点
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print("Successfully loaded checkpoint")
+        
+        start_epoch = checkpoint.get('epoch', 0)
+        print(f"Starting from epoch {start_epoch + 1}")
+        print(f"Initial learning rate: {optimizer.param_groups[0]['lr']:.6f}")
+    else:
+        print("No checkpoint found, starting from scratch")
     
     print("\nStarting training...")
     # 训练模型 - 增加训练轮数
@@ -116,7 +155,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         vocab_idx2word=vocab_idx2word,
-        num_epochs=50,  # 增加训练轮数
+        num_epochs=num_epochs,  # 增加训练轮数
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,  # 添加学习率调度器
