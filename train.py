@@ -395,7 +395,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200,max_sente
                 seq = torch.cat([seq, torch.tensor([2], dtype=torch.long).to(device)])
             final_sequences.append(seq)
         
-        # 找到最长���列的长度
+        # 找到最长公共子序列的长度
         max_length = max(seq.size(0) for seq in final_sequences)
         
         # 将所有序列填充到相同长度
