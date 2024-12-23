@@ -1,130 +1,145 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-import math
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:x.size(0)]
-        return self.dropout(x)
+from transformers import BertModel, BertConfig
 
 class ImageCaptioningModel(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_decoder_layers=6):
+    def __init__(self):
         super().__init__()
+        
+        # 加载BERT模型和配置
+        self.bert_config = BertConfig.from_pretrained('bert-base-uncased')
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
         
         # 使用ViT作为视觉编码器
         self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
+        self.vit.heads = nn.Identity()  # 移除分类头
         
-        # 移除分类头
-        self.vit.heads = nn.Identity()
-        
-        # 冻结大部分ViT参数
+        # 冻结部分参数
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        for param in self.bert.parameters():
+            param.requires_grad = False
+            
+        # 只训练最后几层
         for name, param in self.vit.named_parameters():
-            if 'encoder.layer.11' not in name:  # 只训练最后一个block
-                param.requires_grad = False
+            if 'encoder.layer.11' in name:
+                param.requires_grad = True
+        for name, param in self.bert.named_parameters():
+            if any(layer in name for layer in ['layer.10', 'layer.11', 'pooler']):
+                param.requires_grad = True
         
-        # 特征投影层
-        self.feature_projection = nn.Sequential(
-            nn.Linear(768, d_model * 2),  # ViT-B输出维度为768
-            nn.LayerNorm(d_model * 2),
+        # 视觉特征投影层
+        self.visual_projection = nn.Sequential(
+            nn.Linear(768, self.bert_config.hidden_size),
+            nn.LayerNorm(self.bert_config.hidden_size),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model)
-        )
-        
-        # 词嵌入层
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        
-        # 位置编码
-        self.pos_encoder = PositionalEncoding(d_model)
-        
-        # Transformer解码器
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=0.1,
-            activation='gelu',
-            batch_first=True
-        )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=num_decoder_layers,
-            norm=nn.LayerNorm(d_model)
+            nn.Dropout(0.1)
         )
         
         # 输出层
         self.output_layer = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
+            nn.Linear(self.bert_config.hidden_size, self.bert_config.hidden_size),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(d_model * 2, vocab_size)
+            nn.Linear(self.bert_config.hidden_size, self.bert_config.vocab_size)
         )
         
-        # 初始化参数
-        self._init_parameters()
-        
-    def _init_parameters(self):
-        """初始化模型参数"""
-        for p in self.parameters():
-            if p.dim() > 1 and p.requires_grad:
-                nn.init.xavier_uniform_(p)
-                
-    def generate_square_subsequent_mask(self, sz):
-        """生成注意力掩码"""
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-    
-    def forward(self, images, captions=None, tgt_mask=None):
+    def forward(self, images, input_ids=None, attention_mask=None, labels=None):
         """
         Args:
             images: [batch_size, 3, 224, 224]
-            captions: [batch_size, seq_len]
-            tgt_mask: [seq_len, seq_len]
+            input_ids: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
+            labels: [batch_size, seq_len]
         """
-        # 通过ViT提取特征
-        features = self.vit(images)  # [batch_size, 768]
+        # 1. 视觉特征提取
+        visual_features = self.vit(images)  # [batch_size, 768]
+        visual_features = self.visual_projection(visual_features)  # [batch_size, hidden_size]
         
-        # 投影到d_model维度
-        features = self.feature_projection(features)  # [batch_size, d_model]
-        
-        # 扩展特征维度以匹配Transformer的输入要求
-        memory = features.unsqueeze(1)  # [batch_size, 1, d_model]
-        
-        if captions is not None:
-            # 训练模式
-            # 词嵌入
-            tgt = self.embedding(captions)  # [batch_size, seq_len, d_model]
+        # 2. 扩展视觉特征以匹配序列长度
+        if input_ids is not None:
+            seq_length = input_ids.size(1)
+            visual_features = visual_features.unsqueeze(1).expand(-1, seq_length, -1)
             
-            # 位置编码
-            tgt = tgt.transpose(0, 1)  # [seq_len, batch_size, d_model]
-            tgt = self.pos_encoder(tgt)
-            tgt = tgt.transpose(0, 1)  # [batch_size, seq_len, d_model]
-            
-            # Transformer解码
-            output = self.transformer_decoder(
-                tgt,
-                memory,
-                tgt_mask=tgt_mask
+            # 3. BERT处理
+            # 将视觉特征作为BERT的嵌入
+            bert_outputs = self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                encoder_hidden_states=visual_features,
+                encoder_attention_mask=torch.ones_like(attention_mask),
+                output_hidden_states=True,
+                return_dict=True
             )
             
-            # 生成词概率
-            output = self.output_layer(output)  # [batch_size, seq_len, vocab_size]
+            # 4. 生成输出
+            sequence_output = bert_outputs.last_hidden_state
+            logits = self.output_layer(sequence_output)
+            
+            # 5. 计算损失
+            loss = None
+            if labels is not None:
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fct(logits.view(-1, self.bert_config.vocab_size), labels.view(-1))
+                
+            return {
+                'loss': loss,
+                'logits': logits,
+                'hidden_states': bert_outputs.hidden_states
+            }
             
         else:
-            # 推理模式
-            output = memory
+            return visual_features
+    
+    def generate(self, images, tokenizer, max_length=50, num_beams=4, temperature=1.0):
+        """生成图像描述"""
+        batch_size = images.size(0)
+        device = images.device
+        
+        # 1. 获取视觉特征
+        visual_features = self(images)  # [batch_size, hidden_size]
+        
+        # 2. 准备解码起始token
+        input_ids = torch.full(
+            (batch_size, 1),
+            tokenizer.cls_token_id,
+            dtype=torch.long,
+            device=device
+        )
+        
+        # 3. 生成文本
+        for _ in range(max_length - 1):
+            # 创建attention mask
+            attention_mask = torch.ones_like(input_ids)
             
-        return output
+            # 扩展视觉特征
+            seq_length = input_ids.size(1)
+            curr_visual_features = visual_features.unsqueeze(1).expand(-1, seq_length, -1)
+            
+            # BERT处理
+            outputs = self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                encoder_hidden_states=curr_visual_features,
+                encoder_attention_mask=torch.ones_like(attention_mask),
+                output_hidden_states=True,
+                return_dict=True
+            )
+            
+            # 生成下一个token
+            sequence_output = outputs.last_hidden_state
+            logits = self.output_layer(sequence_output)
+            next_token_logits = logits[:, -1, :] / temperature
+            
+            # 采样下一个token
+            next_token = torch.argmax(next_token_logits, dim=-1)
+            
+            # 添加到序列中
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
+            
+            # 检查是否生成了[SEP]
+            if (next_token == tokenizer.sep_token_id).all():
+                break
+        
+        return input_ids
