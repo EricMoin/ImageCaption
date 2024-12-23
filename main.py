@@ -34,7 +34,7 @@ def main():
     batch_size = 64
     num_epochs = 100
     lr = 1e-3
-    max_len = 100  # 增加最大长度到100                            
+    max_len = 200  # 增加最大长度到100                            
     num_workers = 0
     
     print("Loading datasets...")

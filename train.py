@@ -127,7 +127,7 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
     
     return bleu1, bleu4
 
-def generate_caption(model, image, device, vocab_idx2word, max_len=100):
+def generate_caption(model, image, device, vocab_idx2word, max_len=200,max_sentences=10,min_words_per_sentence=5):
     model.eval()
     
     with torch.no_grad():
@@ -149,8 +149,6 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=100):
         # 跟踪句子状态
         words_since_period = torch.zeros(batch_size, dtype=torch.long).to(device)  # 自上一个句号后的单词数
         sentences_generated = torch.zeros(batch_size, dtype=torch.long).to(device)  # 已生成的句子数
-        min_words_per_sentence = 5  # 每个句子的最小单词数
-        max_sentences = 5  # 增加最大句子数到5
         
         for i in range(max_len - 1):
             # 生成mask
