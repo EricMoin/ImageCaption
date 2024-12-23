@@ -127,7 +127,7 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
     
     return bleu1, bleu4
 
-def generate_caption(model, image, device, vocab_idx2word, max_len=50):
+def generate_caption(model, image, device, vocab_idx2word, max_len=100):
     model.eval()
     
     with torch.no_grad():
@@ -150,7 +150,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
         words_since_period = torch.zeros(batch_size, dtype=torch.long).to(device)  # 自上一个句号后的单词数
         sentences_generated = torch.zeros(batch_size, dtype=torch.long).to(device)  # 已生成的句子数
         min_words_per_sentence = 5  # 每个句子的最小单词数
-        max_sentences = 3  # 最大句子数
+        max_sentences = 5  # 增加最大句子数到5
         
         for i in range(max_len - 1):
             # 生成mask
@@ -190,11 +190,17 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
                     
                     # 如果当前句子足够长，增加句号的概率
                     elif words_since_period[b] >= min_words_per_sentence:
-                        logits[b, :, 4] += 1.0  # 增加句号���logit值
+                        logits[b, :, 4] += 1.0  # 增加句号的logit值
                     
                     # 如果已经生成了足够多的句子，增加END token的概率
                     if sentences_generated[b] >= max_sentences - 1 and words_since_period[b] >= min_words_per_sentence:
                         logits[b, :, 2] += 2.0  # 增加END token的logit值
+                    
+                    # 如果序列长度超过90%，增加句号和END token的概率
+                    if i >= max_len * 0.9:
+                        logits[b, :, 4] += 2.0  # 增加句号的概率
+                        if words_since_period[b] >= min_words_per_sentence:
+                            logits[b, :, 2] += 3.0  # 增加END token的概率
                 
                 # top-k采样
                 top_k = 5

@@ -29,12 +29,12 @@ def main():
     ])
     
     # 设置数据限制 - 增加训练样本数量
-    max_train_samples = 1024  # 增加到1000个训练样本
-    max_val_samples = 128    # 增加到200个验证样本
+    max_train_samples = None  # 增加到1000个训练样本
+    max_val_samples = None    # 增加到200个验证样本
     batch_size = 64
     num_epochs = 100
     lr = 1e-3
-    max_len = 50                             
+    max_len = 100  # 增加最大长度到100                            
     num_workers = 0
     
     print("Loading datasets...")
@@ -124,7 +124,7 @@ def main():
             # 重新创建模型
             model = ImageCaptioningModel(
                 vocab_size=current_vocab_size,
-                d_model=512
+                d_model=512,
             ).to(device)
             
             # 重新初始化优化器和调度器

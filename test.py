@@ -38,7 +38,7 @@ def generate_description(model, image_path, vocab_idx2word, device):
     
     # 生成描述
     with torch.no_grad():
-        generated_ids = generate_caption(model, image_tensor, device)
+        generated_ids = generate_caption(model, image_tensor, device,vocab_idx2word)
         try:
             tokens = [vocab_idx2word[idx.item()] for idx in generated_ids[0]
                      if idx.item() not in [0, 1, 2, 3]]  # 移除特殊token
@@ -50,6 +50,8 @@ def generate_description(model, image_path, vocab_idx2word, device):
     return ' '.join(tokens) if tokens else "Unable to generate description"
 
 def main():
+    print(len("This woman is wearing a medium-sleeve shirt with other patterns and a long trousers. The shirt is with cotton fabric. The neckline of the shirt is crew. The trousers are with denim fabric and solid color patterns. The outer clothing this female wears is with knitting fabric and pure color patterns. There is an accessory in his her neck. The lady wears a ring. There is an accessory on her wrist. This person wears socks in shoes. This woman has a hat in her head."))
+    print(len(" the person is wearing a long sleeve sweater with solid color patterns . the sweater is with cotton fabric . it has a round neckline . the guy wears a long trousers . the trousers are with cotton fabric and solid color patterns ."))
     # 配置参数
     checkpoint_path = 'checkpoints/best_model.pth'
     test_dir = 'data/test'
