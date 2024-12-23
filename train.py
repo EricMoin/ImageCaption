@@ -22,7 +22,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
         tgt_output = captions[:, 1:]
         
         # 创建mask
-        tgt_mask = model.decoder.generate_square_subsequent_mask(tgt_input.size(1)).to(device)
+        tgt_mask = model.generate_square_subsequent_mask(tgt_input.size(1)).to(device)
         
         # 前向传播
         optimizer.zero_grad()
@@ -81,7 +81,7 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
             images = images.to(device)
             
             # 生成描述
-            generated_ids = generate_caption(model, images, device)
+            generated_ids = generate_caption(model, images, device, vocab_idx2word)
             
             # 转换为文本
             for gen_ids, cap_ids in zip(generated_ids, captions):
@@ -127,12 +127,18 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
     
     return bleu1, bleu4
 
-def generate_caption(model, image, device, max_len=50):
+def generate_caption(model, image, device, vocab_idx2word, max_len=50):
     model.eval()
     
     with torch.no_grad():
-        # 编码图像
-        memory = model.encoder(image)
+        # 通过ViT提取特征
+        features = model.vit(image)  # [batch_size, 768]
+        
+        # 投影到d_model维度
+        features = model.feature_projection(features)  # [batch_size, d_model]
+        
+        # 扩展特征维度以匹配Transformer的输入要求
+        memory = features.unsqueeze(1)  # [batch_size, 1, d_model]
         
         # 准备起始token
         batch_size = image.size(0)
@@ -140,12 +146,33 @@ def generate_caption(model, image, device, max_len=50):
         
         generated = start_token
         
+        # 跟踪句子状态
+        words_since_period = torch.zeros(batch_size, dtype=torch.long).to(device)  # 自上一个句号后的单词数
+        sentences_generated = torch.zeros(batch_size, dtype=torch.long).to(device)  # 已生成的句子数
+        min_words_per_sentence = 5  # 每个句子的最小单词数
+        max_sentences = 3  # 最大句子数
+        
         for i in range(max_len - 1):
             # 生成mask
-            tgt_mask = model.decoder.generate_square_subsequent_mask(generated.size(1)).to(device)
+            tgt_mask = model.generate_square_subsequent_mask(generated.size(1)).to(device)
             
-            # 预测下一个token
-            output = model.decoder(generated, memory, tgt_mask)
+            # 词嵌入
+            tgt = model.embedding(generated)  # [batch_size, seq_len, d_model]
+            
+            # 位置编码
+            tgt = tgt.transpose(0, 1)  # [seq_len, batch_size, d_model]
+            tgt = model.pos_encoder(tgt)
+            tgt = tgt.transpose(0, 1)  # [batch_size, seq_len, d_model]
+            
+            # Transformer解码
+            output = model.transformer_decoder(
+                tgt,
+                memory,
+                tgt_mask=tgt_mask
+            )
+            
+            # 生成词概率
+            output = model.output_layer(output)  # [batch_size, seq_len, vocab_size]
             
             # 如果接近最大长度，强制选择END token
             if i >= max_len - 3:
@@ -155,9 +182,19 @@ def generate_caption(model, image, device, max_len=50):
                 temperature = 0.7
                 logits = output[:, -1:] / temperature
                 
-                # 在最后几个token时增加END token的概率
-                if i >= max_len * 0.8:  # 当生成80%的序列长度后
-                    logits[:, :, 2] += 2.0  # 增加END token的logit值
+                # 调整句号和END token的概率
+                for b in range(batch_size):
+                    # 如果当前句子太短，禁止使用句号
+                    if words_since_period[b] < min_words_per_sentence:
+                        logits[b, :, 4] = float('-inf')  # 4是句号的索引
+                    
+                    # 如果当前句子足够长，增加句号的概率
+                    elif words_since_period[b] >= min_words_per_sentence:
+                        logits[b, :, 4] += 1.0  # 增加句号���logit值
+                    
+                    # 如果已经生成了足够多的句子，增加END token的概率
+                    if sentences_generated[b] >= max_sentences - 1 and words_since_period[b] >= min_words_per_sentence:
+                        logits[b, :, 2] += 2.0  # 增加END token的logit值
                 
                 # top-k采样
                 top_k = 5
@@ -170,14 +207,44 @@ def generate_caption(model, image, device, max_len=50):
             # 添加预测的token
             generated = torch.cat([generated, next_token], dim=1)
             
-            # 如果生成了结束token，就停止
-            if (next_token == 2).all():  # <END> token
+            # 更新句子状态
+            for b in range(batch_size):
+                token_id = next_token[b].item()
+                if token_id == 4:  # 句号
+                    sentences_generated[b] += 1
+                    words_since_period[b] = 0
+                elif token_id not in [0, 1, 2, 3, 4]:  # 不是特殊token或句号
+                    words_since_period[b] += 1
+            
+            # 如果生成了结束token或达到最大句子数，就停止
+            if (next_token == 2).all() or (sentences_generated >= max_sentences).all():
                 break
         
-        # 如果没有生成END token，在最后添加
-        if generated[:, -1] != 2:
-            end_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)
-            generated = torch.cat([generated, end_token], dim=1)
+        # 确保所有序列都以句号和END token结束
+        final_sequences = []
+        for b in range(batch_size):
+            seq = generated[b]
+            if seq[-1] != 2:  # 如果最后一个token不是END
+                if words_since_period[b] > 0:  # 如果当前句子还没有结束
+                    # 添加句号
+                    seq = torch.cat([seq, torch.tensor([4], dtype=torch.long).to(device)])
+                # 添加END token
+                seq = torch.cat([seq, torch.tensor([2], dtype=torch.long).to(device)])
+            final_sequences.append(seq)
+        
+        # 找到最长序列的长度
+        max_length = max(seq.size(0) for seq in final_sequences)
+        
+        # 将所有序列填充到相同长度
+        padded_sequences = []
+        for seq in final_sequences:
+            if seq.size(0) < max_length:
+                padding = torch.full((max_length - seq.size(0),), 0, dtype=torch.long).to(device)
+                seq = torch.cat([seq, padding])
+            padded_sequences.append(seq)
+        
+        # 堆叠所有序列
+        generated = torch.stack(padded_sequences)
     
     return generated
 
