@@ -50,8 +50,7 @@ def generate_description(model, image_path, vocab_idx2word, device):
     return ' '.join(tokens) if tokens else "Unable to generate description"
 
 def main():
-    print(len("This woman is wearing a medium-sleeve shirt with other patterns and a long trousers. The shirt is with cotton fabric. The neckline of the shirt is crew. The trousers are with denim fabric and solid color patterns. The outer clothing this female wears is with knitting fabric and pure color patterns. There is an accessory in his her neck. The lady wears a ring. There is an accessory on her wrist. This person wears socks in shoes. This woman has a hat in her head."))
-    # 配置参数
+        # 配置参数
     checkpoint_path = 'checkpoints/best_model.pth'
     test_dir = 'data/test'
     

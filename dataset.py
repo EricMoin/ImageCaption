@@ -242,7 +242,6 @@ class ImageCaptioningDataset(Dataset):
         
     def decode_caption(self, caption_ids):
         """将ID序列解码为文本"""
-        # 使用列表推导式提高效率
         words = [word for id in caption_ids
                 if (word := {v: k for k, v in self.vocab.items()}.get(id.item())) not in 
                 ['<START>', '<PAD>', '<END>', '<UNK>']]

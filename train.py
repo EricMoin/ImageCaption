@@ -429,7 +429,6 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
     
     # 保存词表信息
     vocab_size = len(vocab_idx2word)
-    vocab_idx2word = {int(idx): word for idx, word in vocab_idx2word.items()}
     
     # 学习率预热
     warmup_epochs = 2  # 减少预热轮数

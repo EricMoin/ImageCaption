@@ -28,9 +28,8 @@ def main():
                            std=[0.229, 0.224, 0.225])
     ])
     
-    # 设置数据限制 - 增加训练样本数量
-    max_train_samples = None  # 增加到1000个训练样本
-    max_val_samples = None    # 增加到200个验证样本
+    max_train_samples = None
+    max_val_samples = None
     batch_size = 64
     num_epochs = 100
     lr = 1e-3
@@ -165,7 +164,7 @@ def main():
     )
 
 if __name__ == '__main__':
-    # 设置随机种子以确保可重现性
+    
     torch.manual_seed(42)
     np.random.seed(42)
     
