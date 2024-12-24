@@ -22,7 +22,7 @@ except LookupError:
     nltk.download('stopwords')
 
 class ImageCaptioningDataset(Dataset):
-    def __init__(self, image_folder, annotations_file, transform=None, max_length=50, max_samples=None, use_cache=True):
+    def __init__(self, image_folder, annotations_file, transform=None, max_length=200, max_samples=None, use_cache=True):
         self.image_folder = image_folder
         self.max_length = max_length
         self.transform = transform
@@ -111,26 +111,26 @@ class ImageCaptioningDataset(Dataset):
     
     def _init_special_tokens(self):
         """初始化特殊标记"""
-        special_tokens = ['<PAD>', '<START>', '<END>', '<UNK>']
+        special_tokens = ['<PAD>', '<START>', '<END>', '<UNK>', '.']  # 添加句号作为特殊标记
         for idx, token in enumerate(special_tokens):
             self.vocab[token] = idx
     
     def _clean_text(self, text):
-        """清理和标准化文本"""
+        """清理和标准化文本，保留句号"""
         # 转换为小写
         text = text.lower()
-        # 移除特殊字符和多余的空白
-        text = re.sub(r'[^\w\s]', ' ', text)
+        # 将其他标点符号替换为空格，但保留句号
+        text = re.sub(r'[^\w\s\.]', ' ', text)
+        # 确保句号后面有空格
+        text = re.sub(r'\.', ' . ', text)
+        # 移除多余的空白
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
     def build_vocabulary(self):
-        """使用NLTK构建词表"""
+        """使用NLTK构建词表，保留句号"""
         # 使用集合来存储唯一的词
         word_set = set()
-        
-        # 获取停用词（可选）
-        # stop_words = set(stopwords.words('english'))
         
         # 批处理大小
         batch_size = 100
@@ -148,8 +148,7 @@ class ImageCaptioningDataset(Dataset):
                 clean_text = self._clean_text(text)
                 # 分词
                 tokens = word_tokenize(clean_text)
-                # 添加到词集合（可选：过滤停用词）
-                # tokens = [token for token in tokens if token not in stop_words]
+                # 添加到词集合
                 word_set.update(tokens)
         
         # 将收集到的词添加到词表中
@@ -166,6 +165,7 @@ class ImageCaptioningDataset(Dataset):
         assert self.vocab['<START>'] == 1
         assert self.vocab['<END>'] == 2
         assert self.vocab['<UNK>'] == 3
+        assert self.vocab['.'] == 4  # 确保句号在词表中
     
     def _preload_images(self):
         """预加载所有图像到内存"""

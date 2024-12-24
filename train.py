@@ -127,11 +127,11 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
     
     return bleu1, bleu4
 
-def generate_caption(model, image, device, vocab_idx2word, max_len=50):
+def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sentences=5, min_words_per_sentence=5):
     model.eval()
     
     with torch.no_grad():
-        # ��取网格特征
+        # 提取网格特征
         features = model.backbone(image)  # [batch_size, 2048, 7, 7]
         
         # 投影到d_model维度
@@ -149,7 +149,11 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
         
         generated = start_token
         
-        for i in range(max_len - 1):
+        # 跟踪句子状态
+        words_since_period = torch.zeros(batch_size, dtype=torch.long).to(device)
+        sentences_generated = torch.zeros(batch_size, dtype=torch.long).to(device)
+        
+        for i in range(max_len - 3):  # 预留空间给句号和END token
             # 生成mask
             tgt_mask = model.generate_square_subsequent_mask(generated.size(1)).to(device)
             
@@ -171,37 +175,90 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
             # 生成词概率
             output = model.output_layer(output)  # [batch_size, seq_len, vocab_size]
             
-            # 如果接近最大长度，强制选择END token
-            if i >= max_len - 3:
-                next_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)  # <END> token
-            else:
-                # 添加温度参数和top-k采样
-                temperature = 0.7
-                logits = output[:, -1:] / temperature
+            # 获取最后一个时间步的输出
+            logits = output[:, -1:] / 0.7  # 使用温度参数
+            
+            # 动态调整token概率
+            for b in range(batch_size):
+                # 如果当前句子太短，禁止使用句号
+                if words_since_period[b] < min_words_per_sentence:
+                    logits[b, :, 4] = float('-inf')  # 4是句号的索引
                 
-                # 在最后几个token时增加END token的概率
-                if i >= max_len * 0.8:  # 当生成80%的序列长度后
-                    logits[:, :, 2] += 2.0  # 增加END token的logit值
+                # 如果当前句子足够长，增加句号的概率
+                elif words_since_period[b] >= min_words_per_sentence:
+                    logits[b, :, 4] += 1.0
                 
-                # top-k采样
-                top_k = 5
-                top_probs, top_indices = torch.topk(torch.softmax(logits, dim=-1), k=top_k, dim=-1)
+                # 如果已经生成了足够多的句子，增加END token的概率
+                if sentences_generated[b] >= max_sentences - 1 and words_since_period[b] >= min_words_per_sentence:
+                    logits[b, :, 2] += 2.0  # 2是END token的索引
                 
-                # 根据概率采样
-                selected_indices = torch.multinomial(top_probs.squeeze(1), num_samples=1)
-                next_token = top_indices.squeeze(1).gather(1, selected_indices)
+                # 如果序列长度超过90%，增加句号和END token的概率
+                if i >= (max_len - 5):
+                    logits[b, :, 4] += 2.0  # 增加句号的概率
+                    if words_since_period[b] >= min_words_per_sentence:
+                        logits[b, :, 2] += 3.0  # 增加END token的概率
+            
+            # top-k采样
+            top_k = 5
+            top_probs, top_indices = torch.topk(torch.softmax(logits, dim=-1), k=top_k, dim=-1)
+            
+            # 采样下一个token
+            selected_indices = torch.multinomial(top_probs.squeeze(1), num_samples=1)
+            next_token = top_indices.squeeze(1).gather(1, selected_indices)
             
             # 添加预测的token
             generated = torch.cat([generated, next_token], dim=1)
             
-            # 如果生成了结束token，就停止
-            if (next_token == 2).all():  # <END> token
+            # 更新句子状态
+            for b in range(batch_size):
+                token = next_token[b].item()
+                if token == 4:  # 句号
+                    sentences_generated[b] += 1
+                    words_since_period[b] = 0
+                elif token not in [0, 1, 2]:  # 不是特殊token
+                    words_since_period[b] += 1
+            
+            # 检查是否应该停止生成
+            if (next_token == 2).all() or (sentences_generated >= max_sentences).all():
                 break
         
-        # 如果没有生成END token，在最后添加
-        if not (generated[:, -1] == 2).all():
-            end_token = torch.full((batch_size, 1), 2, dtype=torch.long).to(device)
-            generated = torch.cat([generated, end_token], dim=1)
+        # 确保所有序列都以句号和END token结束
+        final_sequences = []
+        for b in range(batch_size):
+            seq = generated[b]
+            # 如果序列太长，截断它
+            if len(seq) > max_len - 2:  # 为句号和END token预留空间
+                seq = seq[:max_len - 2]
+            
+            # 如果最后一个token不是END且当前句子未结束
+            if seq[-1] != 2 and words_since_period[b] > 0:
+                # 添加句号
+                seq = torch.cat([seq, torch.tensor([4], device=device)])
+            
+            # 如果最后一个token不是END
+            if seq[-1] != 2:
+                # 添加END token
+                seq = torch.cat([seq, torch.tensor([2], device=device)])
+            
+            # 确保序列长度不超过max_len
+            if len(seq) > max_len:
+                seq = seq[:max_len]
+            
+            final_sequences.append(seq)
+        
+        # 找到最长序列的长度
+        max_seq_len = max(len(seq) for seq in final_sequences)
+        
+        # 将所有序列填充到相同长度
+        padded_sequences = []
+        for seq in final_sequences:
+            if len(seq) < max_seq_len:
+                padding = torch.full((max_seq_len - len(seq),), 0, dtype=torch.long, device=device)
+                seq = torch.cat([seq, padding])
+            padded_sequences.append(seq)
+        
+        # 堆叠所有序列
+        generated = torch.stack(padded_sequences)
     
     return generated
 

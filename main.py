@@ -31,10 +31,11 @@ def main():
     # 设置数据限制 - 增加训练样本数量
     max_train_samples = None  # 增加到1000个训练样本
     max_val_samples = None     # 增加到200个验证样本
-    batch_size = 64
+    batch_size = 32          # 减小batch size以适应更长的序列
     num_epochs = 100
-    nhead = 16
-    max_len = 50                             
+    lr = 1e-3
+    nhead = 8               # 调整为标准的transformer head数
+    max_len = 200           # 设置最大序列长度
     num_workers = 0
     
     print("Loading datasets...")
@@ -65,36 +66,43 @@ def main():
         train_dataset, 
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,  # 减少worker数量
-        pin_memory=False,  # 关闭pin_memory以减少内存使用
-        persistent_workers=False  # 关闭持久化workers
+        num_workers=num_workers,
+        pin_memory=False,
+        persistent_workers=False
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,  # 减少worker数量
-        pin_memory=False,  # 关闭pin_memory以减少内存使用
-        persistent_workers=False  # 关闭持久化workers
+        num_workers=num_workers,
+        pin_memory=False,
+        persistent_workers=False
     )
     
     # 创建词表的反向映射（索引到单词）
     vocab_idx2word = {idx: word for word, idx in train_dataset.vocab.items()}
     
     print("\nInitializing model...")
-    # 初始化模型 - 添加dropout
+    # 初始化模型
     model = ImageCaptioningModel(
         vocab_size=len(train_dataset.vocab),
         nhead=nhead,
-        d_model=512
+        d_model=512,
+        num_encoder_layers=6,
+        num_decoder_layers=6
     ).to(device)
     
     # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss(ignore_index=train_dataset.vocab['<PAD>'])
     
     # 创建优化器和学习率调度器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=0.01,
+        betas=(0.9, 0.999)
+    )
 
     # 使用余弦退火学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -126,11 +134,18 @@ def main():
             model = ImageCaptioningModel(
                 vocab_size=current_vocab_size,
                 nhead=nhead,
-                d_model=512
+                d_model=512,
+                num_encoder_layers=6,
+                num_decoder_layers=6
             ).to(device)
             
             # 重新初始化优化器和调度器
-            optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=lr,
+                weight_decay=0.01,
+                betas=(0.9, 0.999)
+            )
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode='max',
