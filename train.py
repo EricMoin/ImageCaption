@@ -2,6 +2,16 @@ import torch
 import torchvision
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.bleu_score import SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+import numpy as np
+from collections import defaultdict
+import re
+from nltk.corpus import wordnet
+import spacy
+from itertools import chain
+import math
+import os
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -67,7 +77,249 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     avg_loss = total_loss / num_batches
     return avg_loss
 
-def evaluate_bleu(model, dataloader, device, vocab_idx2word):
+def compute_meteor(references, hypotheses):
+    """计算METEOR分数"""
+    try:
+        import nltk
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            import ssl
+            try:
+                _create_unverified_https_context = ssl._create_unverified_context
+            except AttributeError:
+                pass
+            else:
+                ssl._create_default_https_context = _create_unverified_https_context
+            nltk.download('punkt', quiet=True)
+    except Exception as e:
+        print(f"Warning: Error loading NLTK data: {e}")
+        pass
+    
+    scores = []
+    for hyp, refs in zip(hypotheses, references):
+        # 确保输入是分词后的列表
+        hyp_tokens = hyp if isinstance(hyp, list) else nltk.word_tokenize(hyp)
+        refs_tokens = [ref if isinstance(ref, list) else nltk.word_tokenize(' '.join(ref)) 
+                      for ref in refs]
+        
+        # 计算每个参考与假设之间的METEOR分数
+        try:
+            score = max(nltk.translate.meteor_score.single_meteor_score(ref, hyp_tokens)
+                       for ref in refs_tokens)
+        except Exception as e:
+            print(f"Error computing METEOR score: {e}")
+            print(f"Hypothesis: {hyp_tokens}")
+            print(f"References: {refs_tokens}")
+            score = 0.0
+        
+        scores.append(score)
+    
+    # 返回平均分数
+    return np.mean(scores) if scores else 0.0
+
+def compute_rouge_l(references, hypotheses):
+    """计算ROUGE-L分数"""
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    scores = []
+    for hyp, refs in zip(hypotheses, references):
+        hyp_str = ' '.join(hyp)
+        max_score = 0
+        for ref in refs:
+            ref_str = ' '.join(ref)
+            score = scorer.score(ref_str, hyp_str)['rougeL'].fmeasure
+            max_score = max(max_score, score)
+        scores.append(max_score)
+    return np.mean(scores)
+
+def compute_cider(references, hypotheses, n_gram=4):
+    """计算CIDEr-D分数"""
+    def build_ngrams(tokens, n):
+        ngrams = defaultdict(int)
+        for i in range(len(tokens) - n + 1):
+            ngram = tuple(tokens[i:i + n])
+            ngrams[ngram] += 1
+        return ngrams
+    
+    def compute_tf_idf(refs_ngrams, hyp_ngrams, doc_freq, ref_len):
+        epsilon = 1e-12
+        tf_idf_scores = []
+        
+        for n in range(1, n_gram + 1):
+            # 计算TF
+            ref_tf = defaultdict(float)
+            hyp_tf = defaultdict(float)
+            
+            # 计算参考文本的TF
+            for ngram, count in refs_ngrams[n-1].items():
+                ref_tf[ngram] = count / max(ref_len, 1)
+            
+            # 计算假设文本的TF
+            hyp_len = sum(hyp_ngrams[n-1].values())
+            for ngram, count in hyp_ngrams[n-1].items():
+                hyp_tf[ngram] = count / max(hyp_len, 1)
+            
+            # 计算IDF
+            num_refs = len(doc_freq)
+            idf = {}
+            for ngram in set(chain(ref_tf.keys(), hyp_tf.keys())):
+                df = doc_freq.get(ngram, 0)
+                idf[ngram] = math.log(num_refs / (df + epsilon))
+            
+            # 计算余弦相似度
+            numerator = 0
+            ref_norm = 0
+            hyp_norm = 0
+            
+            # 所有n-gram的并集
+            all_ngrams = set(chain(ref_tf.keys(), hyp_tf.keys()))
+            
+            for ngram in all_ngrams:
+                ref_tfidf = ref_tf[ngram] * idf.get(ngram, 0)
+                hyp_tfidf = hyp_tf[ngram] * idf.get(ngram, 0)
+                
+                numerator += ref_tfidf * hyp_tfidf
+                ref_norm += ref_tfidf * ref_tfidf
+                hyp_norm += hyp_tfidf * hyp_tfidf
+            
+            denom = math.sqrt(max(ref_norm, epsilon)) * math.sqrt(max(hyp_norm, epsilon))
+            score = numerator / denom if denom > epsilon else 0
+            
+            tf_idf_scores.append(score)
+        
+        return np.mean(tf_idf_scores)
+    
+    # 计算文档频率
+    doc_freq = defaultdict(float)
+    for refs in references:
+        doc_ngrams = set()  # 使用集合来确保每个文档中的n-gram只计算一次
+        for ref in refs:
+            for n_size in range(1, n_gram + 1):
+                ngrams = build_ngrams(ref, n_size)
+                doc_ngrams.update(ngrams.keys())
+        for ngram in doc_ngrams:
+            doc_freq[ngram] += 1
+    
+    scores = []
+    for hyp, refs in zip(hypotheses, references):
+        # 为假设构建n-grams
+        hyp_ngrams = []
+        for i in range(n_gram):
+            hyp_ngrams.append(build_ngrams(hyp, i + 1))
+        
+        # 为每个参考构建n-grams并计算分数
+        ref_scores = []
+        for ref in refs:
+            ref_ngrams = []
+            for i in range(n_gram):
+                ref_ngrams.append(build_ngrams(ref, i + 1))
+            score = compute_tf_idf(ref_ngrams, hyp_ngrams, doc_freq, len(ref))
+            ref_scores.append(score)
+        
+        # 使用最高分数
+        scores.append(max(ref_scores) if ref_scores else 0)
+    
+    # 返回平均分数，乘以10作为最终的CIDEr-D分数
+    final_score = np.mean(scores) * 10.0 if scores else 0.0
+    return final_score
+
+def compute_spice(references, hypotheses):
+    """计算SPICE分数"""
+    try:
+        nlp = spacy.load('en_core_web_sm')
+    except OSError:
+        import subprocess
+        subprocess.run(['python', '-m', 'spacy', 'download', 'en_core_web_sm'])
+        nlp = spacy.load('en_core_web_sm')
+    
+    def extract_scene_graph(text):
+        doc = nlp(text)
+        entities = set()
+        relations = set()
+        attributes = set()
+        
+        # 提取实体和属性
+        for token in doc:
+            if token.pos_ in ['NOUN', 'PROPN']:
+                entities.add(token.text.lower())
+                # 添加形容词修饰
+                for child in token.children:
+                    if child.pos_ == 'ADJ':
+                        attributes.add((token.text.lower(), child.text.lower()))
+        
+        # 提取关系
+        for token in doc:
+            if token.pos_ == 'VERB':
+                subj = None
+                obj = None
+                for child in token.children:
+                    if child.dep_ == 'nsubj':
+                        subj = child.text.lower()
+                    elif child.dep_ in ['dobj', 'pobj']:
+                        obj = child.text.lower()
+                if subj and obj:
+                    relations.add((subj, token.text.lower(), obj))
+        
+        return entities, relations, attributes
+    
+    def compute_f1(ref_graph, hyp_graph):
+        ref_entities, ref_relations, ref_attributes = ref_graph
+        hyp_entities, hyp_relations, hyp_attributes = hyp_graph
+        
+        # 计算实体F1
+        common_entities = len(ref_entities & hyp_entities)
+        if len(ref_entities) == 0 and len(hyp_entities) == 0:
+            entity_f1 = 1.0
+        elif len(ref_entities) == 0 or len(hyp_entities) == 0:
+            entity_f1 = 0.0
+        else:
+            precision = common_entities / len(hyp_entities)
+            recall = common_entities / len(ref_entities)
+            entity_f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0
+        
+        # 计算关系F1
+        common_relations = len(ref_relations & hyp_relations)
+        if len(ref_relations) == 0 and len(hyp_relations) == 0:
+            relation_f1 = 1.0
+        elif len(ref_relations) == 0 or len(hyp_relations) == 0:
+            relation_f1 = 0.0
+        else:
+            precision = common_relations / len(hyp_relations)
+            recall = common_relations / len(ref_relations)
+            relation_f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0
+        
+        # 计算属性F1
+        common_attributes = len(ref_attributes & hyp_attributes)
+        if len(ref_attributes) == 0 and len(hyp_attributes) == 0:
+            attribute_f1 = 1.0
+        elif len(ref_attributes) == 0 or len(hyp_attributes) == 0:
+            attribute_f1 = 0.0
+        else:
+            precision = common_attributes / len(hyp_attributes)
+            recall = common_attributes / len(ref_attributes)
+            attribute_f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0
+        
+        # 综合分数
+        return (entity_f1 + relation_f1 + attribute_f1) / 3
+    
+    scores = []
+    for hyp, refs in zip(hypotheses, references):
+        hyp_text = ' '.join(hyp)
+        hyp_graph = extract_scene_graph(hyp_text)
+        
+        ref_scores = []
+        for ref in refs:
+            ref_text = ' '.join(ref)
+            ref_graph = extract_scene_graph(ref_text)
+            score = compute_f1(ref_graph, hyp_graph)
+            ref_scores.append(score)
+        
+        scores.append(max(ref_scores))
+    
+    return np.mean(scores)
+
+def evaluate_metrics(model, dataloader, device, vocab_idx2word):
+    """评估所有指标"""
     model.eval()
     references = []
     hypotheses = []
@@ -100,32 +352,63 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
                 references.append([ref_tokens])
             
             # 打印评估进度
-            print(f'Evaluating batch [{batch_idx+1}/{num_batches}]')
+            if (batch_idx + 1) % 5 == 0:
+                print(f'Evaluating batch [{batch_idx+1}/{num_batches}]')
+    
+    metrics = {}
+    try:
+        # 计算BLEU分数
+        metrics['bleu1'] = corpus_bleu(references, hypotheses, 
+                                     weights=(1.0, 0, 0, 0),
+                                     smoothing_function=smoothing)
+        metrics['bleu4'] = corpus_bleu(references, hypotheses, 
+                                     weights=(0.25, 0.25, 0.25, 0.25),
+                                     smoothing_function=smoothing)
+    except Exception as e:
+        print(f"Error calculating BLEU scores: {e}")
+        metrics['bleu1'] = 0.0
+        metrics['bleu4'] = 0.0
     
     try:
-        # 计算BLEU分数，使用平滑函数
-        bleu1 = corpus_bleu(references, hypotheses, 
-                           weights=(1.0, 0, 0, 0),
-                           smoothing_function=smoothing)
-        bleu4 = corpus_bleu(references, hypotheses, 
-                           weights=(0.25, 0.25, 0.25, 0.25),
-                           smoothing_function=smoothing)
-        
-        # 打印一些样本结果
-        print("\nSample predictions:")
-        for i in range(min(3, len(hypotheses))):
-            print(f"\nReference: {' '.join(references[i][0])}")
-            print(f"Generated: {' '.join(hypotheses[i])}")
-            
+        # 计算METEOR分数
+        metrics['meteor'] = compute_meteor(references, hypotheses)
     except Exception as e:
-        print("Error calculating BLEU score:")
-        print(f"Number of references: {len(references)}")
-        print(f"Number of hypotheses: {len(hypotheses)}")
-        print("Sample reference:", references[0] if references else "No references")
-        print("Sample hypothesis:", hypotheses[0] if hypotheses else "No hypotheses")
-        raise e
+        print(f"Error calculating METEOR score: {e}")
+        metrics['meteor'] = 0.0
     
-    return bleu1, bleu4
+    try:
+        # 计算ROUGE-L分数
+        metrics['rouge_l'] = compute_rouge_l(references, hypotheses)
+    except Exception as e:
+        print(f"Error calculating ROUGE-L score: {e}")
+        metrics['rouge_l'] = 0.0
+    
+    try:
+        # 计算CIDEr分数
+        metrics['cider'] = compute_cider(references, hypotheses)
+    except Exception as e:
+        print(f"Error calculating CIDEr score: {e}")
+        metrics['cider'] = 0.0
+    
+    try:
+        # 计算SPICE分数
+        metrics['spice'] = compute_spice(references, hypotheses)
+    except Exception as e:
+        print(f"Error calculating SPICE score: {e}")
+        metrics['spice'] = 0.0
+    
+    # 打印一些样本结果
+    print("\nSample predictions:")
+    for i in range(min(3, len(hypotheses))):
+        print(f"\nReference: {' '.join(references[i][0])}")
+        print(f"Generated: {' '.join(hypotheses[i])}")
+    
+    # 打印所有指标
+    print("\nMetrics:")
+    for metric, value in metrics.items():
+        print(f"{metric}: {value:.4f}")
+    
+    return metrics
 
 def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sentences=5, min_words_per_sentence=5):
     model.eval()
@@ -175,7 +458,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
             # 生成词概率
             output = model.output_layer(output)  # [batch_size, seq_len, vocab_size]
             
-            # 获取最后一个时间步的输出
+            # 获最后一个时间步的输出
             logits = output[:, -1:] / 0.7  # 使用温度参数
             
             # 动态调整token概率
@@ -194,7 +477,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
                 
                 # 如果序列长度超过90%，增加句号和END token的概率
                 if i >= (max_len - 5):
-                    logits[b, :, 4] += 2.0  # 增加句号的概率
+                    logits[b, :, 4] += 2.0  # 增加句号的概���
                     if words_since_period[b] >= min_words_per_sentence:
                         logits[b, :, 2] += 3.0  # 增加END token的概率
             
@@ -222,7 +505,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
             if (next_token == 2).all() or (sentences_generated >= max_sentences).all():
                 break
         
-        # 确保所有序列都以句号和END token结束
+        # 确保所有序列都以句号和END token束
         final_sequences = []
         for b in range(batch_size):
             seq = generated[b]
@@ -249,7 +532,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
         # 找到最长序列的长度
         max_seq_len = max(len(seq) for seq in final_sequences)
         
-        # 将所有序列填充到相同长度
+        # 所有序列填充到相同长度
         padded_sequences = []
         for seq in final_sequences:
             if len(seq) < max_seq_len:
@@ -264,10 +547,18 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
 
 def train_model(model, train_loader, val_loader, vocab_idx2word, 
                 num_epochs, criterion, optimizer, scheduler, device, checkpoint_path):
-    best_bleu4 = 0
+    # 初始化所有指标的最佳值
+    best_metrics = {
+        'bleu1': 0,
+        'bleu4': 0,
+        'meteor': 0,
+        'rouge_l': 0,
+        'cider': 0,
+        'spice': 0
+    }
     best_loss = float('inf')
     patience = 3  # 降低耐心值
-    no_improve_bleu = 0  # BLEU-4没有改善的轮数
+    no_improve_metrics = {metric: 0 for metric in best_metrics.keys()}  # 各指标没有改��的轮数
     no_improve_loss = 0  # Loss没有改善的轮数
     min_delta = 1e-4  # 最小改善阈值
     
@@ -280,7 +571,33 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
     warmup_factor = 0.1
     initial_lr = optimizer.param_groups[0]['lr']  # 保存初始学习率
     
-    for epoch in range(num_epochs):
+    # 检查是否有检查点
+    checkpoint_file = f'{checkpoint_path}/best_model.pth'
+    start_epoch = 0
+    if os.path.exists(checkpoint_file):
+        print(f"Loading checkpoint from {checkpoint_file}")
+        checkpoint = torch.load(checkpoint_file, map_location=device)
+        
+        # 检查词表大小是否匹配
+        checkpoint_vocab_size = checkpoint.get('vocab_size')
+        if checkpoint_vocab_size == vocab_size:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_loss = checkpoint.get('loss', float('inf'))
+            # 恢复最佳指标
+            if 'best_metrics' in checkpoint:
+                best_metrics.update(checkpoint['best_metrics'])
+            print("Successfully loaded checkpoint")
+            print("Best metrics from checkpoint:")
+            for metric, value in best_metrics.items():
+                print(f"{metric}: {value:.4f}")
+        else:
+            print(f"Warning: Vocabulary size mismatch! Expected {vocab_size}, got {checkpoint_vocab_size}")
+            print("Starting from scratch with new vocabulary")
+    
+    for epoch in range(start_epoch, num_epochs):
         print(f'\nEpoch {epoch+1}/{num_epochs}')
         print('-' * 50)
         
@@ -295,59 +612,76 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
         print(f'\nAverage Training Loss: {train_loss:.4f}')
         
-        # 计算BLEU分数
-        bleu1, bleu4 = evaluate_bleu(model, val_loader, device, vocab_idx2word)
-        print(f'\nBLEU Scores:')
-        print(f'BLEU-1: {bleu1:.4f}')
-        print(f'BLEU-4: {bleu4:.4f}')
+        # 计算所有评估指标
+        metrics = evaluate_metrics(model, val_loader, device, vocab_idx2word)
+        print('\nValidation Metrics:')
+        for metric, value in metrics.items():
+            print(f'{metric}: {value:.4f}')
         
-        # 更新学习率
-        scheduler.step(bleu4)
+        # 更新学习率 - 使用综合指标
+        composite_score = (metrics['bleu4'] + metrics['meteor'] + metrics['rouge_l'] + 
+                         metrics['cider']/10 + metrics['spice']) / 5
+        scheduler.step(composite_score)
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current learning rate: {current_lr:.6f}')
         
         # 检查是否有显著改善
         loss_improved = train_loss < (best_loss - min_delta)
-        bleu_improved = bleu4 > (best_bleu4 + min_delta)
+        metrics_improved = {
+            metric: value > (best_metrics[metric] + min_delta)
+            for metric, value in metrics.items()
+        }
         
         if loss_improved:
             best_loss = train_loss
             no_improve_loss = 0
         else:
             no_improve_loss += 1
-            
-        if bleu_improved:
-            best_bleu4 = bleu4
-            no_improve_bleu = 0
-            # 保存最佳模型
+        
+        # 更新每个指标的改善状态
+        for metric in metrics:
+            if metrics_improved[metric]:
+                best_metrics[metric] = metrics[metric]
+                no_improve_metrics[metric] = 0
+            else:
+                no_improve_metrics[metric] += 1
+        
+        # 如果任何指标有改善，保存模型
+        if any(metrics_improved.values()):
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': train_loss,
-                'bleu4': bleu4,
+                'metrics': metrics,
+                'best_metrics': best_metrics,
                 'vocab_size': vocab_size,
                 'vocab_idx2word': vocab_idx2word,
-                'initial_lr': initial_lr  # 保存初始学习率
+                'initial_lr': initial_lr
             }, f'{checkpoint_path}/best_model.pth')
-            print(f'\nNew best model saved! BLEU-4: {bleu4:.4f}')
-        else:
-            no_improve_bleu += 1
+            print('\nNew best model saved!')
+            print('Best metrics:')
+            for metric, value in best_metrics.items():
+                print(f'{metric}: {value:.4f}')
         
         # 打印改善状态
-        print(f'\nNo improvement count - Loss: {no_improve_loss}, BLEU-4: {no_improve_bleu}')
-        print(f'Best scores - Loss: {best_loss:.4f}, BLEU-4: {best_bleu4:.4f}')
+        print('\nNo improvement count:')
+        print(f'Loss: {no_improve_loss}')
+        for metric, count in no_improve_metrics.items():
+            print(f'{metric}: {count}')
         
         # 早停条件：
         # 1. Loss连续3轮没有改善
-        # 2. BLEU-4连续3轮没有改善
+        # 2. 所有指标连续3轮没有改善
         # 3. 学习率已经很小
-        if (no_improve_loss >= patience and no_improve_bleu >= patience) or \
+        if (no_improve_loss >= patience and 
+            all(count >= patience for count in no_improve_metrics.values())) or \
            current_lr < 1e-6:
             print(f'\nEarly stopping:')
             print(f'- Loss not improved for {no_improve_loss} epochs')
-            print(f'- BLEU-4 not improved for {no_improve_bleu} epochs')
+            for metric, count in no_improve_metrics.items():
+                print(f'- {metric} not improved for {count} epochs')
             print(f'- Current learning rate: {current_lr}')
             break
         
@@ -359,10 +693,11 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': train_loss,
-                'bleu4': bleu4,
+                'metrics': metrics,
+                'best_metrics': best_metrics,
                 'vocab_size': vocab_size,
                 'vocab_idx2word': vocab_idx2word,
-                'initial_lr': initial_lr  # 保存初始学习率
+                'initial_lr': initial_lr
             }, f'{checkpoint_path}/checkpoint_epoch{epoch+1}.pth')
             
         print('-' * 50)

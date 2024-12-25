@@ -38,7 +38,7 @@ def generate_description(model, image_path, vocab_idx2word, device):
     
     # 生成描述
     with torch.no_grad():
-        generated_ids = generate_caption(model, image_tensor, device)
+        generated_ids = generate_caption(model, image_tensor, device,vocab_idx2word=vocab_idx2word)
         try:
             tokens = [vocab_idx2word[idx.item()] for idx in generated_ids[0]
                      if idx.item() not in [0, 1, 2, 3]]  # 移除特殊token
