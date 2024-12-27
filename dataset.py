@@ -128,7 +128,6 @@ class ImageCaptioningDataset(Dataset):
         return text
     
     def build_vocabulary(self):
-        """使用NLTK构建词表，保留句号"""
         # 使用集合来存储唯一的词
         word_set = set()
         

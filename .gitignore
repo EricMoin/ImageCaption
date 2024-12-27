@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 checkpoints/
 *.7z
+*.txt

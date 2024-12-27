@@ -8,7 +8,7 @@ import numpy as np
 
 from dataset import ImageCaptioningDataset
 from models import ImageCaptioningModel
-from train import train_model, generate_description
+from train import train_model, generate_caption
 
 def main():
     # 创建必要的目录

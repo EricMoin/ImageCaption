@@ -13,6 +13,8 @@ from itertools import chain
 import math
 import os
 
+from models import ImageCaptioningModel
+
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     total_loss = 0
@@ -410,22 +412,28 @@ def evaluate_metrics(model, dataloader, device, vocab_idx2word):
     
     return metrics
 
-def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sentences=5, min_words_per_sentence=5):
+def generate_caption(model:ImageCaptioningModel, image, device, vocab_idx2word, max_len=200, max_sentences=5, min_words_per_sentence=5):
     model.eval()
     
     with torch.no_grad():
         # 提取网格特征
-        features = model.backbone(image)  # [batch_size, 2048, 7, 7]
+        features = model.grid_encoder.backbone(image)  # [batch_size, 2048, 7, 7]
         
         # 投影到d_model维度
-        features = model.feature_projection(features)  # [batch_size, d_model, 7, 7]
+        features = model.grid_encoder.feature_projection(features)  # [batch_size, d_model, 7, 7]
         
         # 重塑为序列
         batch_size = features.size(0)
         features = features.view(batch_size, features.size(1), -1).permute(0, 2, 1)  # [batch_size, 49, d_model]
         
-        # Transformer编码
-        memory = model.transformer_encoder(features)  # [batch_size, 49, d_model]
+        # 添加位置编码
+        features = model.grid_encoder.pos_encoding(features)
+        
+        # 使用图网络处理特征
+        features = model.grid_encoder.graph_network(features)  # [batch_size, 49, d_model]
+        
+        # 特征归一化
+        memory = model.grid_encoder.norm(features)  # [batch_size, 49, d_model]
         
         # 准备起始token
         start_token = torch.full((batch_size, 1), 1, dtype=torch.long).to(device)  # <START> token
@@ -477,7 +485,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
                 
                 # 如果序列长度超过90%，增加句号和END token的概率
                 if i >= (max_len - 5):
-                    logits[b, :, 4] += 2.0  # 增加句号的概���
+                    logits[b, :, 4] += 2.0  # 增加句号的概率
                     if words_since_period[b] >= min_words_per_sentence:
                         logits[b, :, 2] += 3.0  # 增加END token的概率
             
@@ -505,7 +513,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=200, max_sent
             if (next_token == 2).all() or (sentences_generated >= max_sentences).all():
                 break
         
-        # 确保所有序列都以句号和END token束
+        # 确保所有序列都以句号和END token结束
         final_sequences = []
         for b in range(batch_size):
             seq = generated[b]
@@ -558,7 +566,7 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
     }
     best_loss = float('inf')
     patience = 3  # 降低耐心值
-    no_improve_metrics = {metric: 0 for metric in best_metrics.keys()}  # 各指标没有改��的轮数
+    no_improve_metrics = {metric: 0 for metric in best_metrics.keys()}  # 各指标没有改进的轮数
     no_improve_loss = 0  # Loss没有改善的轮数
     min_delta = 1e-4  # 最小改善阈值
     
