@@ -60,11 +60,25 @@ class GridEncoder(nn.Module):
         # 位置编码
         self.pos_embed = nn.Parameter(torch.randn(1, grid_size * grid_size, d_model))
         
-        # 多层多头注意力
-        self.attention_layers = nn.ModuleList([
+        # 区域内部自注意力层
+        self.self_attention_layers = nn.ModuleList([
             MultiHeadAttentionBlock(d_model, nhead, dropout)
             for _ in range(num_layers)
         ])
+        
+        # 区域间注意力层
+        self.cross_attention_layers = nn.ModuleList([
+            MultiHeadAttentionBlock(d_model, nhead, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # 最终特征融合层
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         
     def forward(self, x):
         # 1. 通过CNN提取特征
@@ -75,19 +89,29 @@ class GridEncoder(nn.Module):
         features = nn.functional.adaptive_avg_pool2d(features, (self.grid_size, self.grid_size))
         
         # 3. 重塑为序列形式
-        features = features.reshape(B, C, -1).permute(0, 2, 1)
+        features = features.reshape(B, C, -1).permute(0, 2, 1)  # [B, grid_size*grid_size, C]
         
         # 4. 投影到所需维度
-        features = self.feature_projection(features)
+        features = self.feature_projection(features)  # [B, grid_size*grid_size, d_model]
         
         # 5. 添加位置编码
         features = features + self.pos_embed
         
-        # 6. 多层自注意力处理
-        for layer in self.attention_layers:
-            features = layer(features, features, features)
+        # 6. 区域内部自注意力处理
+        self_attn_features = features
+        for layer in self.self_attention_layers:
+            self_attn_features = layer(self_attn_features, self_attn_features, self_attn_features)
         
-        return features
+        # 7. 区域间注意力处理
+        cross_attn_features = features
+        for layer in self.cross_attention_layers:
+            cross_attn_features = layer(cross_attn_features, self_attn_features, self_attn_features)
+        
+        # 8. 特征融合
+        combined_features = torch.cat([self_attn_features, cross_attn_features], dim=-1)
+        output = self.fusion(combined_features)
+        
+        return output
 
 class GridDecoder(nn.Module):
     def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=3, dropout=0.1, max_length=80):
@@ -95,15 +119,15 @@ class GridDecoder(nn.Module):
         
         # 词嵌入层
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, max_length, d_model))  # 使用max_length参数
+        self.pos_embed = nn.Parameter(torch.randn(1, max_length, d_model))
         
-        # 多层自注意力
+        # 自注意力层
         self.self_attention_layers = nn.ModuleList([
             MultiHeadAttentionBlock(d_model, nhead, dropout)
             for _ in range(num_layers)
         ])
         
-        # 多层交叉注意力
+        # 交叉注意力层
         self.cross_attention_layers = nn.ModuleList([
             MultiHeadAttentionBlock(d_model, nhead, dropout)
             for _ in range(num_layers)
@@ -151,7 +175,7 @@ class GridDecoder(nn.Module):
         return output
 
 class ImageCaptioningModel(nn.Module):
-    def __init__(self, vocab_size, nhead=8,num_layers=3,d_model=512, max_length=80):
+    def __init__(self, vocab_size, nhead=8, num_layers=3, d_model=512, max_length=80):
         super().__init__()
         self.encoder = GridEncoder(
             grid_size=7,
@@ -166,7 +190,7 @@ class ImageCaptioningModel(nn.Module):
             nhead=nhead,
             num_layers=num_layers,
             dropout=0.1,
-            max_length=max_length  # 传递max_length参数
+            max_length=max_length
         )
         
     def forward(self, img, tgt, tgt_mask=None):

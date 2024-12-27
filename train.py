@@ -3,6 +3,11 @@ import torch.nn as nn
 import torchvision
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.bleu_score import SmoothingFunction
+from rouge_score.rouge_scorer import RougeScorer
+from pycocoevalcap.meteor.meteor import Meteor
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.spice.spice import Spice
+import numpy as np
 
 # 定义特殊token的索引
 START_TOKEN = 1
@@ -87,12 +92,20 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_len=50):
     avg_loss = total_loss / num_batches
     return avg_loss
 
-def evaluate_bleu(model, dataloader, device, vocab_idx2word):
+def evaluate_metrics(model, dataloader, device, vocab_idx2word):
     model.eval()
     references = []
     hypotheses = []
+    raw_refs = {}  # 用于CIDEr和SPICE的原始参考
+    raw_hyps = {}  # 用于CIDEr和SPICE的原始假设
     smoothing = SmoothingFunction().method1
     num_batches = len(dataloader)
+    
+    # 初始化评测器
+    meteor_scorer = Meteor()
+    rouge_scorer = RougeScorer(['rougeL'], use_stemmer=True)
+    cider_scorer = Cider()
+    spice_scorer = Spice()
     
     print(f"\nEvaluating on {len(dataloader.dataset)} samples in {num_batches} batches")
     
@@ -104,24 +117,30 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
             generated_ids = generate_caption(model, images, device, vocab_idx2word)
             if generated_ids is None:
                 print("Warning: Using empty generation for this batch")
-                # 使用空生成而不是跳过
                 generated_ids = torch.full((images.size(0), 3), END_TOKEN, dtype=torch.long).to(device)
             
             # 转换为文本
-            for gen_ids, cap_ids in zip(generated_ids, captions):
+            for idx, (gen_ids, cap_ids) in enumerate(zip(generated_ids, captions)):
                 # 处理生成的描述
                 pred_tokens = [vocab_idx2word[idx.item()] for idx in gen_ids 
                              if idx.item() not in [PAD_TOKEN, START_TOKEN, END_TOKEN]]
-                if not pred_tokens:  # 如果生成的描述为空，添加一个占位符
+                if not pred_tokens:
                     pred_tokens = ['<unk>']
-                hypotheses.append(pred_tokens)
                 
                 # 处理真实描述
                 ref_tokens = [vocab_idx2word[idx.item()] for idx in cap_ids 
                             if idx.item() not in [PAD_TOKEN, START_TOKEN, END_TOKEN]]
-                if not ref_tokens:  # 如果参考描述为空，添加一个占位符
+                if not ref_tokens:
                     ref_tokens = ['<unk>']
+                
+                # 为BLEU准备分词后的文本
+                hypotheses.append(pred_tokens)
                 references.append([ref_tokens])
+                
+                # 为其他指标准备原始文本
+                current_idx = len(raw_refs)
+                raw_refs[current_idx] = [' '.join(ref_tokens)]
+                raw_hyps[current_idx] = [' '.join(pred_tokens)]
             
             # 打印评估进度和样本
             print(f'Evaluating batch [{batch_idx+1}/{num_batches}]')
@@ -134,24 +153,47 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
     # 确保至少有一个有效的预测和参考
     if not hypotheses or not references:
         print("Warning: No valid predictions or references")
-        return 0.0, 0.0
+        return {
+            'bleu1': 0.0, 'bleu4': 0.0, 'meteor': 0.0,
+            'rouge_l': 0.0, 'cider': 0.0, 'spice': 0.0
+        }
     
     try:
         # 计算BLEU分数
-        bleu1 = corpus_bleu(references, hypotheses, 
+        bleu1 = corpus_bleu(references, hypotheses,
                            weights=(1.0, 0, 0, 0),
                            smoothing_function=smoothing)
-        bleu4 = corpus_bleu(references, hypotheses, 
+        bleu4 = corpus_bleu(references, hypotheses,
                            weights=(0.25, 0.25, 0.25, 0.25),
                            smoothing_function=smoothing)
+        
+        # 计算METEOR分数
+        meteor_score = meteor_scorer.compute_score(raw_refs, raw_hyps)[0]
+        
+        # 计算ROUGE-L分数
+        rouge_scores = []
+        for i in range(len(hypotheses)):
+            scores = rouge_scorer.score(raw_refs[i][0], raw_hyps[i][0])
+            rouge_scores.append(scores['rougeL'].fmeasure)
+        rouge_l_score = np.mean(rouge_scores)
+        
+        # 计算CIDEr分数
+        cider_score = cider_scorer.compute_score(raw_refs, raw_hyps)[0]
+        
+        # 计算SPICE分数
+        spice_score = spice_scorer.compute_score(raw_refs, raw_hyps)[0]
+        
     except Exception as e:
-        print("Error calculating BLEU score:")
+        print("Error calculating metrics:")
         print(f"Number of references: {len(references)}")
         print(f"Number of hypotheses: {len(hypotheses)}")
-        print("Sample reference:", references[0] if references else "No references")
-        print("Sample hypothesis:", hypotheses[0] if hypotheses else "No hypotheses")
+        print("Sample reference:", ' '.join(references[0][0]) if references else "No references")
+        print("Sample hypothesis:", ' '.join(hypotheses[0]) if hypotheses else "No hypotheses")
         print(f"Error: {str(e)}")
-        return 0.0, 0.0
+        return {
+            'bleu1': 0.0, 'bleu4': 0.0, 'meteor': 0.0,
+            'rouge_l': 0.0, 'cider': 0.0, 'spice': 0.0
+        }
     
     # 打印样本结果
     print("\nSample predictions:")
@@ -159,9 +201,24 @@ def evaluate_bleu(model, dataloader, device, vocab_idx2word):
         print(f"\nReference: {' '.join(references[i][0])}")
         print(f"Generated: {' '.join(hypotheses[i])}")
     
-    return bleu1, bleu4
+    # 返回所有指标
+    metrics = {
+        'bleu1': bleu1,
+        'bleu4': bleu4,
+        'meteor': meteor_score,
+        'rouge_l': rouge_l_score,
+        'cider': cider_score,
+        'spice': spice_score
+    }
+    
+    # 打印所有指标
+    print("\nEvaluation Metrics:")
+    for metric, score in metrics.items():
+        print(f"{metric.upper()}: {score:.4f}")
+    
+    return metrics
 
-def generate_caption(model, image, device, vocab_idx2word, max_len=50):
+def generate_caption(model, image, device, vocab_idx2word, max_len=200):
     model.eval()
     
     # 获取句号的token ID
@@ -186,12 +243,13 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
         generated = start_token
         
         # 动态调整温度参数
-        base_temperature = 1.2  # 增加基础温度以提高多样性
-        min_temperature = 0.6   # 增加最小温度以保持多样性
+        base_temperature = 1.0  # 降低基础温度以生成更连贯的句子
+        min_temperature = 0.5   # 保持较低的最小温度
         
         # 句子结构控制
-        min_words_per_sentence = 5  # 每个句子的最小词数
-        max_sentences = 3       # 最大句子数量
+        min_words_per_sentence = 8    # 增加每个句子的最小词数
+        max_words_per_sentence = 20   # 设置每个句子的最大词数
+        max_sentences = 5            # 增加最大句子数量
         sentence_count = torch.zeros(batch_size, dtype=torch.long).to(device)
         words_since_period = torch.zeros(batch_size, dtype=torch.long).to(device)
         
@@ -205,7 +263,7 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
             
             # 动态调整温度参数
             progress = i / max_len
-            temperature = max(min_temperature, base_temperature * (1 - progress * 0.5))
+            temperature = max(min_temperature, base_temperature * (1 - progress * 0.3))
             logits = logits / temperature
             
             # 更新句子统计
@@ -221,14 +279,18 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
                     logits[b, :, PERIOD_TOKEN] = float('-inf')
                 
                 # 如果句子太长，增加句号概率
-                elif words_since_period[b] >= min_words_per_sentence * 2:
-                    period_boost = (words_since_period[b] - min_words_per_sentence) * 0.5
+                elif words_since_period[b] >= max_words_per_sentence:
+                    period_boost = min(5.0, (words_since_period[b] - max_words_per_sentence) * 0.5)
                     logits[b, :, PERIOD_TOKEN] += period_boost
                 
                 # 如果已经生成足够的句子，强制结束
                 if sentence_count[b] >= max_sentences:
                     logits[b, :, :] = float('-inf')  # 禁用所有token
                     logits[b, :, END_TOKEN] = 0.0  # 只允许END token
+                
+                # 如果序列接近最大长度但还没有足够的句子，增加句号概率
+                if i >= (max_len * 0.8) and sentence_count[b] < (max_sentences - 1):
+                    logits[b, :, PERIOD_TOKEN] += 3.0
             
             # 使用top-k和top-p采样
             top_k = 5
@@ -263,9 +325,14 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
                 break
             
             # 如果序列太长，检查是否可以结束
-            if i >= max_len - 10:
-                # 如果已经生成了至少一个完整的句子，可以结束
+            if i >= max_len - 20:
+                # 如果已经生成了至少一个��整的句子，可以结束
                 if (sentence_count >= 1).all():
+                    # 添加句号（如果当前不是句号）
+                    if (generated[:, -1] != PERIOD_TOKEN).any():
+                        period_token = torch.full((batch_size, 1), PERIOD_TOKEN, dtype=torch.long).to(device)
+                        generated = torch.cat([generated, period_token], dim=1)
+                    # 添加END token
                     end_token = torch.full((batch_size, 1), END_TOKEN, dtype=torch.long).to(device)
                     generated = torch.cat([generated, end_token], dim=1)
                     break
@@ -297,10 +364,17 @@ def generate_caption(model, image, device, vocab_idx2word, max_len=50):
 
 def train_model(model, train_loader, val_loader, vocab_idx2word, 
                 num_epochs, criterion, optimizer, scheduler, device, checkpoint_path):
-    best_bleu4 = 0
+    best_metrics = {
+        'bleu1': 0.0,
+        'bleu4': 0.0,
+        'meteor': 0.0,
+        'rouge_l': 0.0,
+        'cider': 0.0,
+        'spice': 0.0
+    }
     best_loss = float('inf')
     patience = 5  # 增加耐心值
-    no_improve_bleu = 0  # BLEU-4没有改善的轮数
+    no_improve_metrics = {metric: 0 for metric in best_metrics.keys()}  # 各指标没有改进的轮数
     no_improve_loss = 0  # Loss没有改善的轮数
     min_delta = 1e-4  # 最小改善阈值
     
@@ -328,55 +402,65 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
         print(f'\nAverage Training Loss: {train_loss:.4f}')
         
-        # 计算BLEU分数
-        bleu1, bleu4 = evaluate_bleu(model, val_loader, device, vocab_idx2word)
-        print(f'\nBLEU Scores:')
-        print(f'BLEU-1: {bleu1:.4f}')
-        print(f'BLEU-4: {bleu4:.4f}')
+        # 计算所有评测指标
+        metrics = evaluate_metrics(model, val_loader, device, vocab_idx2word)
         
-        # 更新学习率
-        scheduler.step(bleu4)
+        # 更新学习率（使用CIDEr作为主要指标）
+        scheduler.step(metrics['cider'])
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current learning rate: {current_lr:.6f}')
         
         # 检查是否有显著改善
         loss_improved = train_loss < (best_loss - min_delta)
-        bleu_improved = bleu4 > (best_bleu4 + min_delta)
+        metrics_improved = {
+            metric: score > (best_metrics[metric] + min_delta)
+            for metric, score in metrics.items()
+        }
         
         if loss_improved:
             best_loss = train_loss
             no_improve_loss = 0
         else:
             no_improve_loss += 1
-            
-        if bleu_improved:
-            best_bleu4 = bleu4
-            no_improve_bleu = 0
-            # 保存最佳模型
+        
+        # 更新每个指标的改善状态
+        for metric in best_metrics.keys():
+            if metrics_improved[metric]:
+                best_metrics[metric] = metrics[metric]
+                no_improve_metrics[metric] = 0
+            else:
+                no_improve_metrics[metric] += 1
+        
+        # 如果任何指标有改善，保存模型
+        if any(metrics_improved.values()):
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': train_loss,
-                'bleu4': bleu4,
+                'metrics': metrics,
                 'vocab_size': vocab_size,
                 'vocab_idx2word': vocab_idx2word,
                 'initial_lr': initial_lr
             }, f'{checkpoint_path}/best_model.pth')
-            print(f'\nNew best model saved! BLEU-4: {bleu4:.4f}')
-        else:
-            no_improve_bleu += 1
+            print('\nNew best model saved!')
         
         # 打印改善状态
-        print(f'\nNo improvement count - Loss: {no_improve_loss}, BLEU-4: {no_improve_bleu}')
-        print(f'Best scores - Loss: {best_loss:.4f}, BLEU-4: {best_bleu4:.4f}')
+        print('\nMetrics improvement status:')
+        print(f'Loss: {no_improve_loss} epochs without improvement')
+        for metric, count in no_improve_metrics.items():
+            print(f'{metric.upper()}: {count} epochs without improvement')
         
-        # 早停条件：只在性能没有改善时停止
-        if no_improve_loss >= patience and no_improve_bleu >= patience:
-            print(f'\nEarly stopping:')
-            print(f'- Loss not improved for {no_improve_loss} epochs')
-            print(f'- BLEU-4 not improved for {no_improve_bleu} epochs')
+        print('\nBest scores:')
+        print(f'Loss: {best_loss:.4f}')
+        for metric, score in best_metrics.items():
+            print(f'{metric.upper()}: {score:.4f}')
+        
+        # 早停条件：所有指标都没有改善
+        if (no_improve_loss >= patience and 
+            all(count >= patience for count in no_improve_metrics.values())):
+            print('\nEarly stopping: No improvement in any metric')
             break
         
         # 定期保存检查点
@@ -387,7 +471,7 @@ def train_model(model, train_loader, val_loader, vocab_idx2word,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': train_loss,
-                'bleu4': bleu4,
+                'metrics': metrics,
                 'vocab_size': vocab_size,
                 'vocab_idx2word': vocab_idx2word,
                 'initial_lr': initial_lr
@@ -408,6 +492,6 @@ def generate_description(model, image_path, transform, vocab_idx2word, device):
         
     # 转换为文本
     tokens = [vocab_idx2word[idx.item()] for idx in generated_ids[0]
-             if idx.item() not in [0, 1, 2, 3]]  # 移除特殊token
+             if idx.item() not in [0, 1, 2, 3]]  # 除特殊token
     
     return ' '.join(tokens) 

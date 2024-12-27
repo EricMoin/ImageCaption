@@ -31,13 +31,13 @@ def main():
     # 设置数据限制 - 增加训练样本数量
     max_train_samples = None  # 增加到10155个训练样本
     max_val_samples = None     # 增加到1024个验证样本
-    batch_size = 64
+    batch_size = 32          # 减小batch size以适应更长的序列
     num_epochs = 50
-    max_len = 80                                 
+    max_len = 200           # 增加最大长度以支持更长的描述                                
     num_workers = 0
     
     print("Loading datasets...")
-    # 创建数据集
+    # 创建数据集    
     print("Loading training dataset...")
     train_dataset = ImageCaptioningDataset(
         image_folder='data/images',
