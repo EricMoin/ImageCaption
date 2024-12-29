@@ -1,145 +1,112 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
-from transformers import BertModel, BertConfig
+from transformers import ViTModel, GPT2LMHeadModel, GPT2Config
 
 class ImageCaptioningModel(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size, hidden_size=768):
         super().__init__()
         
-        # 加载BERT模型和配置
-        self.bert_config = BertConfig.from_pretrained('bert-base-uncased')
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        # 视觉编码器 (ViT)
+        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224')
         
-        # 使用ViT作为视觉编码器
-        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
-        self.vit.heads = nn.Identity()  # 移除分类头
-        
-        # 冻结部分参数
+        # 冻结ViT的大部分参数
         for param in self.vit.parameters():
             param.requires_grad = False
-        for param in self.bert.parameters():
-            param.requires_grad = False
-            
         # 只训练最后几层
-        for name, param in self.vit.named_parameters():
-            if 'encoder.layer.11' in name:
-                param.requires_grad = True
-        for name, param in self.bert.named_parameters():
-            if any(layer in name for layer in ['layer.10', 'layer.11', 'pooler']):
+        for param in self.vit.encoder.layer[-2:].parameters():
+            param.requires_grad = True
+        
+        # GPT2配置和模型 - 启用交叉注意力
+        gpt2_config = GPT2Config.from_pretrained('gpt2')
+        gpt2_config.add_cross_attention = True  # 启用交叉注意力
+        gpt2_config.use_cache = True
+        self.gpt = GPT2LMHeadModel.from_pretrained('gpt2', config=gpt2_config)
+        self.gpt.resize_token_embeddings(vocab_size)  # 调整词表大小
+        
+        # 冻结GPT2的部分参数
+        for param in self.gpt.parameters():
+            param.requires_grad = False
+        # 只训练交叉注意力层、最后几层和词嵌入
+        trainable_layers = ['wte', 'crossattention', 'h.9', 'h.10', 'h.11', 'ln_f']
+        for name, param in self.gpt.named_parameters():
+            if any(layer in name for layer in trainable_layers):
                 param.requires_grad = True
         
-        # 视觉特征投影层
-        self.visual_projection = nn.Sequential(
-            nn.Linear(768, self.bert_config.hidden_size),
-            nn.LayerNorm(self.bert_config.hidden_size),
+        # 特征映射层
+        self.feature_mapping = nn.Sequential(
+            nn.Linear(768, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.Dropout(0.1)
         )
         
-        # 输出层
-        self.output_layer = nn.Sequential(
-            nn.Linear(self.bert_config.hidden_size, self.bert_config.hidden_size),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.bert_config.hidden_size, self.bert_config.vocab_size)
-        )
-        
     def forward(self, images, input_ids=None, attention_mask=None, labels=None):
-        """
-        Args:
-            images: [batch_size, 3, 224, 224]
-            input_ids: [batch_size, seq_len]
-            attention_mask: [batch_size, seq_len]
-            labels: [batch_size, seq_len]
-        """
-        # 1. 视觉特征提取
-        visual_features = self.vit(images)  # [batch_size, 768]
-        visual_features = self.visual_projection(visual_features)  # [batch_size, hidden_size]
+        batch_size = images.size(0)
+        device = images.device
         
-        # 2. 扩展视觉特征以匹配序列长度
+        # 1. 提取视觉特征
+        vision_outputs = self.vit(images, output_hidden_states=True)
+        image_features = vision_outputs.last_hidden_state
+        
+        # 2. 映射特征维度
+        image_features = self.feature_mapping(image_features)
+        
         if input_ids is not None:
-            seq_length = input_ids.size(1)
-            visual_features = visual_features.unsqueeze(1).expand(-1, seq_length, -1)
-            
-            # 3. BERT处理
-            # 将视觉特征作为BERT的嵌入
-            bert_outputs = self.bert(
+            # 3. GPT2生成
+            outputs = self.gpt(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                encoder_hidden_states=visual_features,
-                encoder_attention_mask=torch.ones_like(attention_mask),
-                output_hidden_states=True,
+                encoder_hidden_states=image_features,
+                encoder_attention_mask=torch.ones(batch_size, image_features.size(1), device=device),
+                labels=labels,
+                use_cache=True,
                 return_dict=True
             )
             
-            # 4. 生成输出
-            sequence_output = bert_outputs.last_hidden_state
-            logits = self.output_layer(sequence_output)
-            
-            # 5. 计算损失
-            loss = None
-            if labels is not None:
-                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                loss = loss_fct(logits.view(-1, self.bert_config.vocab_size), labels.view(-1))
-                
             return {
-                'loss': loss,
-                'logits': logits,
-                'hidden_states': bert_outputs.hidden_states
+                'loss': outputs.loss,
+                'logits': outputs.logits,
+                'hidden_states': outputs.hidden_states
             }
-            
-        else:
-            return visual_features
+        
+        return image_features
     
-    def generate(self, images, tokenizer, max_length=50, num_beams=4, temperature=1.0):
+    def generate(self, images, tokenizer, max_length=50, temperature=1.0, min_length=10, top_k=10, top_p=0.9):
         """生成图像描述"""
         batch_size = images.size(0)
         device = images.device
         
         # 1. 获取视觉特征
-        visual_features = self(images)  # [batch_size, hidden_size]
+        vision_outputs = self.vit(images, output_hidden_states=True)
+        image_features = vision_outputs.last_hidden_state
+        image_features = self.feature_mapping(image_features)
         
-        # 2. 准备解码起始token
+        # 2. 准备起始token
         input_ids = torch.full(
             (batch_size, 1),
-            tokenizer.cls_token_id,
+            tokenizer.bos_token_id,
             dtype=torch.long,
             device=device
         )
         
-        # 3. 生成文本
-        for _ in range(max_length - 1):
-            # 创建attention mask
-            attention_mask = torch.ones_like(input_ids)
-            
-            # 扩展视觉特征
-            seq_length = input_ids.size(1)
-            curr_visual_features = visual_features.unsqueeze(1).expand(-1, seq_length, -1)
-            
-            # BERT处理
-            outputs = self.bert(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                encoder_hidden_states=curr_visual_features,
-                encoder_attention_mask=torch.ones_like(attention_mask),
-                output_hidden_states=True,
-                return_dict=True
-            )
-            
-            # 生成下一个token
-            sequence_output = outputs.last_hidden_state
-            logits = self.output_layer(sequence_output)
-            next_token_logits = logits[:, -1, :] / temperature
-            
-            # 采样下一个token
-            next_token = torch.argmax(next_token_logits, dim=-1)
-            
-            # 添加到序列中
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
-            
-            # 检查是否生成了[SEP]
-            if (next_token == tokenizer.sep_token_id).all():
-                break
+        # 3. 使用GPT2的生成功能
+        output_sequences = self.gpt.generate(
+            input_ids=input_ids,
+            encoder_hidden_states=image_features,
+            encoder_attention_mask=torch.ones(batch_size, image_features.size(1), device=device),
+            max_length=max_length,
+            min_length=min_length,
+            do_sample=True,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            num_return_sequences=1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            no_repeat_ngram_size=3
+        )
         
-        return input_ids
+        return output_sequences

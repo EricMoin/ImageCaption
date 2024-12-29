@@ -1,0 +1,28 @@
+Transformer:
+bleu1: 0.6115
+bleu4: 0.3218
+meteor: 0.5308
+rouge_l: 0.4682
+cider: 1.8012
+spice: 0.2924
+
+
+Grid + Transformer
+训练缓慢
+bleu1: 0.3806
+bleu4: 0.1888
+meteor: 0.4014
+rouge_l: 0.3168
+cider: 1.2627
+spice: 0.2450
+
+Grid+图网络+Transformer
+训练缓慢
+bleu1: 0.1328
+bleu4: 0.0392
+meteor: 0.1514
+rouge_l: 0.1097
+cider: 0.3911
+spice: 0.0968
+
+Grid+Attention

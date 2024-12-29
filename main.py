@@ -5,11 +5,11 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import os
 import numpy as np
-from transformers import BertTokenizer
+from transformers import GPT2Tokenizer
 
 from dataset import ImageCaptioningDataset
 from models import ImageCaptioningModel
-from train import train_model, generate_description
+from train import train_model
 
 def main():
     # 创建必要的目录
@@ -20,9 +20,17 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # 加载BERT tokenizer
-    print("Loading BERT tokenizer...")
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    # 加载GPT2 tokenizer
+    print("Loading GPT2 tokenizer...")
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    # 添加特殊token
+    special_tokens = {
+        'pad_token': '[PAD]',
+        'bos_token': '[CLS]',
+        'eos_token': '[SEP]',
+        'unk_token': '[UNK]'
+    }
+    tokenizer.add_special_tokens(special_tokens)
     
     # 数据预处理
     transform = transforms.Compose([
@@ -33,11 +41,11 @@ def main():
     ])
     
     # 设置数据限制
-    max_train_samples = None  # 不限制训练样本数量
-    max_val_samples = None    # 不限制验证样本数量
-    batch_size = 32
+    max_train_samples = 1024
+    max_val_samples = 128
+    batch_size = 16  # 减小批次大小
     num_epochs = 50
-    max_len = 200
+    max_len = 128    # GPT2上下文长度
     num_workers = 0
     
     print("Loading datasets...")
@@ -79,38 +87,47 @@ def main():
     
     print("\nInitializing model...")
     # 初始化模型
-    model = ImageCaptioningModel().to(device)
+    model = ImageCaptioningModel(vocab_size=len(tokenizer)).to(device)
     
     # 创建优化器和学习率调度器
-    optimizer = torch.optim.AdamW(
-        [
-            {'params': model.vit.parameters(), 'lr': 1e-4},
-            {'params': model.bert.parameters(), 'lr': 5e-5},
-            {'params': [p for n, p in model.named_parameters() 
-                       if not any(m in n for m in ['vit', 'bert'])], 
-             'lr': 1e-4}
-        ],
-        weight_decay=0.01
-    )
+    # 为不同组件设置不同的学习率
+    optimizer = torch.optim.AdamW([
+        {'params': model.vit.parameters(), 'lr': 1e-5},
+        {'params': model.gpt.parameters(), 'lr': 2e-5},
+        {'params': model.feature_mapping.parameters(), 'lr': 1e-4}
+    ], weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    # 使用余弦退火调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        mode='max',
-        factor=0.5,
-        patience=2,
-        verbose=True
+        T_0=5,  # 第一次重启的周期
+        T_mult=2,  # 每次重启后周期翻倍
+        eta_min=1e-6  # 最小学习率
     )
     
     # 如果有检查点，加载它
     checkpoint_path = 'checkpoints'
     checkpoint_file = f'{checkpoint_path}/best_model.pth'
     if os.path.exists(checkpoint_file):
-        print(f"Loading checkpoint from {checkpoint_file}")
-        checkpoint = torch.load(checkpoint_file, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        print("Successfully loaded checkpoint")
+        print(f"Found existing checkpoint at {checkpoint_file}")
+        response = input("Model architecture has changed. Do you want to (1) start fresh or (2) try to load the checkpoint? [1/2]: ")
+        if response == "2":
+            try:
+                print("Attempting to load checkpoint...")
+                checkpoint = torch.load(checkpoint_file, map_location=device)
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("Successfully loaded compatible weights from checkpoint")
+            except Exception as e:
+                print(f"Error loading checkpoint: {str(e)}")
+                print("Starting from scratch instead")
+        else:
+            print("Starting fresh with new model architecture")
+            # 重命名旧的检查点文件
+            import time
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            os.rename(checkpoint_file, f'{checkpoint_path}/old_model_{timestamp}.pth')
     else:
         print("No checkpoint found, starting from scratch")
     

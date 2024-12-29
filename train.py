@@ -73,7 +73,6 @@ def evaluate_metrics(model, dataloader, device, tokenizer):
                 images=images,
                 tokenizer=tokenizer,
                 max_length=50,
-                num_beams=4,
                 temperature=0.7
             )
             
