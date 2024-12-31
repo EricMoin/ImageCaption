@@ -41,8 +41,8 @@ def main():
     ])
     
     # 设置数据限制
-    max_train_samples = 1024
-    max_val_samples = 128
+    max_train_samples = None
+    max_val_samples = None
     batch_size = 16  # 减小批次大小
     num_epochs = 50
     max_len = 128    # GPT2上下文长度

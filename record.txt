@@ -26,3 +26,13 @@ cider: 0.3911
 spice: 0.0968
 
 Grid+Attention
+
+
+GPT-2
+
+BLEU1: 0.4811
+BLEU4: 0.2152
+METEOR: 0.4367
+ROUGE_L: 0.4715
+
+CNN+GRU
